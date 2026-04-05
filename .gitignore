@@ -8,4 +8,7 @@ dist/
 org_sessions/
 agent_memories.json
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 paper_portfolio.json

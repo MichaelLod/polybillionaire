@@ -72,6 +72,7 @@ class AgentWorker:
         self.display = display
         self.toolkit = toolkit
         self.system_prompt = _get_prompt(config.system_prompt_key)
+        self._shared_findings_q: queue.Queue | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._session_id: str | None = None
@@ -149,15 +150,27 @@ class AgentWorker:
     # ── Main loop ──────────────────────────────────────────────
 
     def _run(self) -> None:
-        try:
-            if self.config.role == "research":
-                self._research_loop()
-            elif self.config.role == "reasoning":
-                self._reasoning_loop()
-        except Exception as e:
+        retries = 0
+        max_retries = 5
+        while not self._stop.is_set() and retries < max_retries:
+            try:
+                if self.config.role == "research":
+                    self._research_loop()
+                elif self.config.role == "reasoning":
+                    self._reasoning_loop()
+                break  # clean exit
+            except Exception as e:
+                retries += 1
+                self.bus.post(
+                    self.config.name, "all", "alert",
+                    f"Agent error ({retries}/{max_retries}): {str(e)[:80]}",
+                )
+                if retries < max_retries:
+                    self._stop.wait(10 * retries)  # backoff: 10s, 20s, 30s...
+        if retries >= max_retries:
             self.bus.post(
                 self.config.name, "all", "alert",
-                f"Agent crashed: {str(e)[:100]}",
+                f"Agent gave up after {max_retries} retries",
             )
 
     # ── Research loop (4th dimension) ────────────────────────────
@@ -374,7 +387,11 @@ class AgentWorker:
     # ── Reasoning loop ─────────────────────────────────────────
 
     def _reasoning_loop(self) -> None:
-        findings_q = self.bus.subscribe("finding")
+        findings_q = self._shared_findings_q or self.bus.subscribe("finding")
+        self.bus.post(
+            self.config.name, "all", "info",
+            "Awaiting findings...",
+        )
 
         while not self._stop.is_set():
             # Collect a batch of findings (faster in power mode)
@@ -469,6 +486,27 @@ class AgentWorker:
                         "hypothesis_ref": hyp_ref,
                     })
 
+            # Parse sell proposals
+            sell_proposals = []
+            for sm in re.finditer(
+                r"SELL:\s*(\S+).*?Reason:\s*(.+?)(?:\n\n|\nTRADE|\nHYPOTHESIS|\nSELL|\Z)",
+                resp.text, re.IGNORECASE | re.DOTALL,
+            ):
+                token_id = sm.group(1).strip()
+                reason = sm.group(2).strip()[:200]
+                sell_proposals.append({
+                    "token_id": token_id,
+                    "reason": reason,
+                })
+
+            if sell_proposals:
+                for sp in sell_proposals:
+                    self.bus.emit(
+                        "sell_proposal", self.config.name,
+                        sp,
+                        content=f"EXIT {sp['token_id']}: {sp['reason'][:80]}",
+                    )
+
             # Parse and create hypotheses
             hyp_count = 0
             for hm in re.finditer(
@@ -491,14 +529,15 @@ class AgentWorker:
                         "trade_proposal", self.config.name,
                         p, content=f"{p['side']} \"{p['opp']['market'][:50]}\"",
                     )
-                self.display.agent_done(
-                    self.config.name,
-                    f"{len(proposals)} trades, {hyp_count} hypotheses",
-                )
-            elif hyp_count:
-                self.display.agent_done(
-                    self.config.name, f"{hyp_count} hypotheses, no trades yet",
-                )
+            parts = []
+            if proposals:
+                parts.append(f"{len(proposals)} trades")
+            if sell_proposals:
+                parts.append(f"{len(sell_proposals)} exits")
+            if hyp_count:
+                parts.append(f"{hyp_count} hypotheses")
+            if parts:
+                self.display.agent_done(self.config.name, ", ".join(parts))
             else:
                 self.display.agent_done(self.config.name, "no edge")
 
@@ -548,19 +587,27 @@ class TradeExecutor:
         self.bus = bus
         self.display = display
         self._proposals_q = bus.subscribe("trade_proposal")
+        self._sells_q = bus.subscribe("sell_proposal")
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sell_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self._run, name="trade-executor", daemon=True,
         )
         self._thread.start()
+        self._sell_thread = threading.Thread(
+            target=self._run_sells, name="sell-executor", daemon=True,
+        )
+        self._sell_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._sell_thread:
+            self._sell_thread.join(timeout=5)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -632,6 +679,59 @@ class TradeExecutor:
                 "Trader", "all", "alert", f"Failed: {result['message']}",
             )
 
+    def _run_sells(self) -> None:
+        while not self._stop.is_set():
+            try:
+                msg = self._sells_q.get(timeout=5)
+            except queue.Empty:
+                continue
+            try:
+                self._execute_sell(msg.data)
+            except Exception as e:
+                self.bus.post(
+                    "Trader", "all", "alert",
+                    f"Sell error: {str(e)[:100]}",
+                )
+
+    def _execute_sell(self, proposal: dict) -> None:
+        token_id = proposal["token_id"]
+        reason = proposal.get("reason", "thesis invalidated")
+
+        # Verify we actually hold this position
+        pos = next(
+            (p for p in self.trader.positions if p.token_id == token_id),
+            None,
+        )
+        if not pos:
+            return
+
+        self.display.tool_call("Trader", "execute_sell")
+        result = self.toolkit.execute_sell(token_id)
+
+        if result["success"]:
+            self.bus.post(
+                "Trader", "all", "trade",
+                f"[EXIT] Sold \"{pos.market_question[:40]}\" — {reason}",
+            )
+            # Update linked hypothesis
+            db_pos = self.db._fetchone(
+                "SELECT hypothesis_id FROM positions WHERE token_id = ?",
+                (token_id,),
+            )
+            if db_pos and db_pos.get("hypothesis_id"):
+                self.db.update_hypothesis(
+                    db_pos["hypothesis_id"], status="dismissed",
+                )
+            self.bus.emit(
+                "trade_result", "Trader",
+                {"success": True, "sell": True, "token_id": token_id},
+            )
+        else:
+            self.bus.post(
+                "Trader", "all", "alert",
+                f"Exit failed {token_id}: {result['message']}",
+            )
+
 
 # ── Swarm ──────────────────────────────────────────────────────
 
@@ -661,6 +761,8 @@ class Swarm:
         self.monitor: MonitorThread | None = None
         self.trade_executor: TradeExecutor | None = None
         self.inspiration: InspirationEngine | None = None
+        # Shared queue so multiple Reasoning agents compete for findings
+        self._shared_findings_q: queue.Queue = bus.subscribe("finding")
 
     def _start_fast_trade_listener(self) -> None:
         """Listen for high-confidence surfaced findings and try to match
@@ -794,7 +896,7 @@ class Swarm:
         backend = create_backend(
             config.backend_type,
             model=config.model,
-            tools=config.tools or None,
+            tools=config.tools if config.tools is not None else None,
             api_key=config.api_key,
             base_url=config.base_url,
             max_tokens=config.max_tokens,
@@ -804,6 +906,8 @@ class Swarm:
             config, backend, self.bus, self.db, self.display,
             toolkit=self.toolkit if config.role == "reasoning" else None,
         )
+        if config.role == "reasoning":
+            worker._shared_findings_q = self._shared_findings_q
         self.workers[config.name] = worker
         worker.start()
         self.bus.post(

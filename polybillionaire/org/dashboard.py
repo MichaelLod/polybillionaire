@@ -115,36 +115,38 @@ class ShipClass:
 # Using: █ ▓ ▒ ░ ▀ ▄ ▌ ▐ ► ◄ ▸ ◂ ◆ ◈
 
 SHIP_SPRITES: dict[str, list[str]] = {
-    "scout": [          # Scanner — fast corvette, faces right
-        "   ░▒▓█►  ",
-        "  ▒▓████▓▸",
-        " ░▓██████►",
-        "  ▒▓████▓▸",
-        "   ░▒▓█►  ",
-    ],
-    "probe": [          # Diver — torpedo, faces down for diving
-        "    ▄█▄    ",
-        "   ▐███▌   ",
-        "   ▐█▓█▌   ",
-        "    ▓▒▓    ",
-        "    ░▒░    ",
-        "     ▀     ",
-    ],
-    "interceptor": [    # Contrarian — angular attack ship
-        "  █▓░ ░▓█  ",
-        "   ▓███▓   ",
+    "scout": [          # Scanner — fast corvette, faces UP
+        "     ▄     ",
+        "    ▐█▌    ",
+        "   ░███░   ",
         "  ▒█████▒  ",
-        "   ▓███▓   ",
-        "  █▓░ ░▓█  ",
+        "  ▓█▀▀▀█▓  ",
+        "  ░▌   ▐░  ",
     ],
-    "battlecruiser": [  # Reasoning — heavy capital ship
-        "  ░▒▓████▓▒░  ",
-        "   ▓██████▓   ",
-        "  ▒████████▒  ",
-        "   ▓██████▓   ",
-        "  ░▒▓████▓▒░  ",
+    "probe": [          # Diver — torpedo, faces UP (nose at top)
+        "     █     ",
+        "    ▐█▌    ",
+        "    ███    ",
+        "   ▐█▓█▌   ",
+        "   ░▓▒▓░   ",
+        "    ░▀░    ",
     ],
-    "mothership": [     # System — central station, always present
+    "interceptor": [    # Contrarian — angular attack ship, faces UP
+        "     ▄     ",
+        "   ▄███▄   ",
+        "  █▓███▓█  ",
+        "  ░▀███▀░  ",
+        " ▓▀     ▀▓ ",
+    ],
+    "battlecruiser": [  # Reasoning — heavy capital ship, faces UP
+        "     ▄▄     ",
+        "   ▄████▄   ",
+        "  ▓██████▓  ",
+        "  ████████  ",
+        " ▒██▀▀▀▀██▒ ",
+        " ░▌      ▐░ ",
+    ],
+    "mothership": [     # System — central station, symmetric
         "    ▄███▄    ",
         "  ░▓█████▓░  ",
         "  ▒███████▒  ",
@@ -178,7 +180,7 @@ SHIP_CLASSES: dict[str, ShipClass] = {
     ),
     "battlecruiser": ShipClass(
         key="r", label="Battlecruiser", agent_prefix="Reasoning",
-        max_count=1, color="yellow", exhaust="═══",
+        max_count=2, color="yellow", exhaust="═══",
         sprite=SHIP_SPRITES["battlecruiser"],
     ),
 }
@@ -304,6 +306,12 @@ class Dashboard:
 
         # Power mode — burns tokens faster for aggressive trading
         self.power_mode = False
+
+        # Intel status line
+        self._last_trade_status: str = ""
+        self._last_trade_ts: float = 0.0
+        self._last_finding: str = ""
+        self._last_finding_ts: float = 0.0
 
         # Hints
         self.hints: list[dict[str, str]] = []
@@ -518,6 +526,27 @@ class Dashboard:
             for name in self.agents:
                 if name != msg.sender:
                     self._active_flows[f"{msg.sender}->{name}"] = 10
+        # Capture latest trade activity for status line
+        if msg.kind == "trade":
+            if "[EXIT]" in msg.content or "[MANAGE]" in msg.content:
+                self._last_trade_status = f"[bold yellow]SOLD[/bold yellow] {msg.content[:80]}"
+            else:
+                self._last_trade_status = f"[bold green]BOUGHT[/bold green] {msg.content[:80]}"
+            self._last_trade_ts = msg.ts
+        elif msg.kind == "rejection":
+            self._last_trade_status = f"[red]PASS[/red] {msg.content[:80]}"
+            self._last_trade_ts = msg.ts
+
+        # Capture latest finding for intel line
+        if msg.kind == "finding":
+            title = msg.data.get("finding", {}).get("title", msg.content[:60]) if msg.data else msg.content[:60]
+            conf = msg.data.get("finding", {}).get("confidence", "") if msg.data else ""
+            surfaced = msg.data.get("surfaced", False) if msg.data else False
+            tag = "[bold cyan]SURFACED[/bold cyan]" if surfaced else "[cyan]FOUND[/cyan]"
+            conf_str = f" [{CONF_COLOR.get(conf, 'dim')}]({conf})[/{CONF_COLOR.get(conf, 'dim')}]" if conf else ""
+            self._last_finding = f"{tag} {msg.sender}: {title[:55]}{conf_str}"
+            self._last_finding_ts = msg.ts
+
         # Trigger burst glow on findings
         if msg.kind == "finding":
             self._burst_frames[msg.sender] = 8
@@ -816,6 +845,7 @@ class Dashboard:
             Layout(name="header", size=3),
             Layout(name="content", ratio=1, minimum_size=8),
             Layout(name="fleet", size=3),
+            Layout(name="trade_status", size=5),
             Layout(name="footer", size=1),
         ]
         layout["main"].split_column(*main_parts)
@@ -828,6 +858,7 @@ class Dashboard:
         # Populate header / fleet / footer / sidebar
         layout["header"].update(self._hdr())
         layout["fleet"].update(self._fleet_panel())
+        layout["trade_status"].update(self._trade_status_line())
         layout["footer"].update(self._ftr())
         layout["memory"].update(self._memory_panel())
         layout["hints"].update(self._hints_panel())
@@ -887,6 +918,58 @@ class Dashboard:
             title="[bold]FLEET COMMAND[/bold]",
             title_align="left",
             border_style="dim yellow",
+            padding=(0, 1),
+        )
+
+    def _trade_status_line(self) -> Panel:
+        def _ago(ts: float) -> str:
+            if ts <= 0:
+                return ""
+            d = time.time() - ts
+            if d < 60:
+                return f"{int(d)}s"
+            if d < 3600:
+                return f"{int(d / 60)}m"
+            return f"{int(d / 3600)}h"
+
+        # Row 1: Latest finding
+        if self._last_finding:
+            finding_line = f"{self._last_finding}  [dim]{_ago(self._last_finding_ts)}[/dim]"
+        else:
+            finding_line = "[dim]Scanning...[/dim]"
+
+        # Row 2: Hypothesis summary from DB
+        hyp_line = ""
+        if self.db:
+            try:
+                active = self.db.get_active_hypotheses()
+                by_status: dict[str, int] = {}
+                for h in active:
+                    by_status[h["status"]] = by_status.get(h["status"], 0) + 1
+                parts = []
+                if by_status.get("investigating"):
+                    parts.append(f"[cyan]{by_status['investigating']} investigating[/cyan]")
+                if by_status.get("edge_found"):
+                    parts.append(f"[yellow]{by_status['edge_found']} edge found[/yellow]")
+                if by_status.get("traded"):
+                    parts.append(f"[green]{by_status['traded']} traded[/green]")
+                if by_status.get("active"):
+                    parts.append(f"[dim]{by_status['active']} queued[/dim]")
+                hyp_line = "  ".join(parts) if parts else "[dim]no active hypotheses[/dim]"
+            except Exception:
+                hyp_line = "[dim]...[/dim]"
+
+        # Row 3: Latest trade decision
+        if self._last_trade_status:
+            trade_line = f"{self._last_trade_status}  [dim]{_ago(self._last_trade_ts)}[/dim]"
+        else:
+            trade_line = "[dim]No trades yet[/dim]"
+
+        return Panel(
+            Text.from_markup(f"  {finding_line}\n  {hyp_line}\n  {trade_line}"),
+            title="[bold]INTEL[/bold]",
+            title_align="left",
+            border_style="dim cyan",
             padding=(0, 1),
         )
 
@@ -985,14 +1068,22 @@ class Dashboard:
         agent_positions: dict[str, tuple[int, int]] = {}  # name -> (px, py)
         agent_colors: dict[str, str] = {}
         selected = self._selected_agent
-        center_x, center_y = canvas_w // 2, (canvas_h - 4) // 2
+        center_x, center_y = canvas_w // 2, canvas_h // 2
+
+        # Find grid extents to center the fleet
+        max_gx = max((pos[0] for pos in self._agent_grid_pos.values()), default=0)
+        max_gy = max((pos[1] for pos in self._agent_grid_pos.values()), default=0)
+        grid_w = (max_gx + 1) * cell_w
+        grid_h = (max_gy + 1) * cell_h
+        offset_x = (canvas_w - grid_w) // 2
+        offset_y = (canvas_h - grid_h) // 2
 
         for name in sorted(self.agents.keys()):
             st = self.agents.get(name, AgentStatus())
             gx, gy = self._agent_grid_pos.get(name, (0, 0))
 
-            base_x = gx * cell_w + cell_w // 2
-            base_y = gy * cell_h + cell_h // 2
+            base_x = offset_x + gx * cell_w + cell_w // 2
+            base_y = offset_y + gy * cell_h + cell_h // 2
 
             # Drift — each ship has unique orbital motion
             phase = hash(name) % 100 * 0.0628
@@ -1032,50 +1123,65 @@ class Dashboard:
             agent_colors[name] = color
             agent_positions[name] = (px, py)
 
-            # Engine exhaust particles for active ships
-            if active and self._frame % 3 == 0:
-                ex = px - 2 if ship_key in ("scout", "battlecruiser") else px
-                ey = py + 3 if ship_key == "probe" else py
-                self._particle_trails.append((ex, ey, 12, base_color))
+            # Engine exhaust — all ships face up, exhaust trails downward
+            if active and self._frame % 2 == 0:
+                import random as _rng
+                spread = 2 if ship_key in ("battlecruiser", "mothership") else 1
+                ex = px + _rng.randint(-spread, spread)
+                ey = py + 4  # below the ship
+                self._particle_trails.append((ex, ey, 14, base_color))
+                # Extra exhaust for big ships
+                if ship_key in ("battlecruiser", "mothership"):
+                    self._particle_trails.append((ex + _rng.randint(-1, 1), ey + 1, 10, base_color))
 
         # ── Build 2D canvas ────────────────────────────────────
         chars = [[" "] * canvas_w for _ in range(canvas_h)]
         styles = [[""] * canvas_w for _ in range(canvas_h)]
 
-        # ── Parallax starfield ─────────────────────────────────
+        # ── Parallax starfield — scrolls top-to-bottom (flying upward) ──
         star_chars = [".", "·", "*"]
         star_styles = ["bright_black", "dim", "bold white"]
-        star_speeds = [0.15, 0.35, 0.7]
+        star_speeds = [0.3, 0.7, 1.4]  # vertical scroll speeds
         for sx, sy, layer in self._stars:
-            # Parallax drift — each layer scrolls at different speed
+            # Stars drift downward — we're flying up through space
             drift = int(t * star_speeds[layer])
-            dx = (sx + drift) % canvas_w
-            dy = sy % canvas_h
+            dx = sx % canvas_w
+            dy = (sy + drift) % canvas_h
             if 0 <= dx < canvas_w and 0 <= dy < canvas_h:
-                # Twinkle: some stars blink
+                # Twinkle: bright stars blink
                 if layer == 2:
                     twinkle = math.sin(t * 2.0 + sx * 0.3 + sy * 0.7)
                     if twinkle < -0.3:
-                        continue  # star blinks off
+                        continue
                     if twinkle > 0.7:
                         chars[dy][dx] = "✦"
                         styles[dy][dx] = "bold cyan"
                         continue
-                chars[dy][dx] = star_chars[layer]
-                styles[dy][dx] = star_styles[layer]
+                # Near stars streak vertically for speed effect
+                if layer == 2 and dy + 1 < canvas_h:
+                    chars[dy][dx] = "│"
+                    styles[dy][dx] = "dim white"
+                    chars[dy + 1][dx] = "|"
+                    styles[dy + 1][dx] = "bright_black"
+                else:
+                    chars[dy][dx] = star_chars[layer]
+                    styles[dy][dx] = star_styles[layer]
 
-        # ── Render exhaust particle trails ─────────────────────
+        # ── Render exhaust particle trails (thrust downward) ───
         for px, py, ttl, pc in self._particle_trails:
             if 0 <= px < canvas_w and 0 <= py < canvas_h:
-                fade = ttl / 12.0
-                if fade > 0.7:
-                    chars[py][px] = "░"
+                fade = ttl / 14.0
+                if fade > 0.75:
+                    chars[py][px] = "▓"
+                    styles[py][px] = f"bold {pc}"
+                elif fade > 0.55:
+                    chars[py][px] = "▒"
                     styles[py][px] = pc
-                elif fade > 0.4:
-                    chars[py][px] = "·"
+                elif fade > 0.35:
+                    chars[py][px] = "░"
                     styles[py][px] = f"dim {pc}"
                 elif fade > 0.15:
-                    chars[py][px] = "."
+                    chars[py][px] = "·"
                     styles[py][px] = "bright_black"
 
         # ── Render projectiles ─────────────────────────────────

@@ -583,7 +583,7 @@ class LMStudioBackend(AgentBackend):
 
     MAX_TOOL_ROUNDS = 5
     MAX_TOOL_CALLS_PER_ROUND = 1  # Force one tool call at a time
-    TOOL_ROUND_MAX_TOKENS = 1024  # Limit tokens during tool rounds to prevent spam
+    TOOL_ROUND_MAX_TOKENS = 2048  # Limit tokens during tool rounds to prevent spam
 
     def __init__(
         self,
@@ -591,11 +591,13 @@ class LMStudioBackend(AgentBackend):
         model: str = "google/gemma-4-26b-a4b",
         timeout: float = 300,
         max_tokens: int = 4096,
+        tools: list | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self._use_tools = tools is None or len(tools) > 0
 
     def send(
         self,
@@ -619,11 +621,12 @@ class LMStudioBackend(AgentBackend):
         total_output = 0
         start = time.time()
 
-        for _round in range(self.MAX_TOOL_ROUNDS):
-            last_round = _round == self.MAX_TOOL_ROUNDS - 1
+        max_rounds = self.MAX_TOOL_ROUNDS if self._use_tools else 1
+        for _round in range(max_rounds):
+            last_round = _round == max_rounds - 1
 
             # On last round, drop tools and ask model to summarize
-            if last_round:
+            if last_round and self._use_tools and _round > 0:
                 messages.append({
                     "role": "user",
                     "content": "Now summarize all the information you found. "
@@ -637,7 +640,7 @@ class LMStudioBackend(AgentBackend):
                 "messages": messages,
                 "max_tokens": self.max_tokens if last_round else self.TOOL_ROUND_MAX_TOKENS,
             }
-            if not last_round:
+            if self._use_tools and not last_round:
                 body["tools"] = _LM_TOOLS
                 body["parallel_tool_calls"] = False
 
@@ -773,5 +776,5 @@ def create_backend(
     if backend_type == "openai-compat":
         return OpenAiCompatBackend(model=model, **_filter(OpenAiCompatBackend, kwargs))
     if backend_type == "lm-studio":
-        return LMStudioBackend(model=model, **_filter(LMStudioBackend, kwargs))
+        return LMStudioBackend(model=model, tools=tools, **_filter(LMStudioBackend, kwargs))
     raise ValueError(f"Unknown backend type: {backend_type!r}")

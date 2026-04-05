@@ -965,15 +965,37 @@ class OrgDB:
                 lines.append(f"  [{h['status']}] {h['title']}{price_str}")
             parts.append("== HYPOTHESES ==\n" + "\n".join(lines))
 
-        # Current positions (avoid duplicates)
+        # Current positions — full detail for exit evaluation
         positions = self.get_positions()
         if positions:
-            lines = [
-                f"  HOLDING: {p['outcome']} \"{p['market_question'][:50]}\" "
-                f"@ ${p['entry_price']:.3f}"
-                for p in positions[:10]
-            ]
-            parts.append("== CURRENT POSITIONS (avoid duplicates) ==\n" + "\n".join(lines))
+            now = time.time()
+            lines = []
+            for p in positions[:15]:
+                entry = p["entry_price"] or 0
+                cur = p["current_price"] or entry
+                pnl = p["pnl"] or 0
+                cost = p["cost"] or 0
+                pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+                opened = p.get("synced_at") or now
+                days_held = max(0, int((now - opened) / 86400))
+                end = p.get("end_date", "")
+                end_str = f" expires {end}" if end else ""
+                hyp_id = p.get("hypothesis_id")
+                hyp_tag = ""
+                if hyp_id:
+                    h = self._fetchone(
+                        "SELECT title FROM hypotheses WHERE id = ?", (hyp_id,),
+                    )
+                    if h:
+                        hyp_tag = f" [hyp: {h['title'][:40]}]"
+                lines.append(
+                    f"  {p['token_id']}: {p['outcome']} \"{p['market_question'][:50]}\" "
+                    f"entry ${entry:.3f} now ${cur:.3f} "
+                    f"pnl {pnl_pct:+.0f}% ({days_held}d held){end_str}{hyp_tag}"
+                )
+            parts.append(
+                "== CURRENT POSITIONS (review for exits) ==\n" + "\n".join(lines)
+            )
 
         # Recent rejections (don't re-propose)
         rejs = self.get_recent_rejections(limit=5)

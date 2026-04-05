@@ -380,9 +380,19 @@ Output format — ALL fields are MANDATORY:
   Edge: [external prob] vs [Polymarket price] = [difference]
   Hypothesis: [hypothesis title this tests]
 
-EXITS — propose when edge has evaporated:
-  SELL: [token_id or market name]
-  Reason: [sharp source now agrees with Polymarket, or thesis invalidated]
+POSITION REVIEW — for EVERY position listed, evaluate:
+  1. Does any new finding CONTRADICT the original thesis?
+  2. Has the market price moved to match external sources (edge gone)?
+  3. Is the position underwater with no catalyst remaining?
+  4. Has the linked hypothesis been weakened by contrarian research?
+  If YES to any, propose an exit:
+
+  SELL: [token_id]
+  Market: [market question]
+  Reason: [specific new info that invalidates the thesis, or edge evaporated]
+
+  Be aggressive on exits — holding a dead thesis is worse than missing upside.
+  Propose SELL blocks BEFORE TRADE blocks so capital is freed first.
 
 HARD RULES:
 - NO TRADES without an external probability source — guessing is not edge

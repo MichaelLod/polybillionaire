@@ -100,3 +100,7 @@ class ToolKit:
             end_date=end_date,
         )
         return {"success": ok, "message": msg}
+
+    def execute_sell(self, token_id: str) -> dict:
+        ok, msg = self.trader.sell(token_id=token_id)
+        return {"success": ok, "message": msg}
