@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.ruff_cache/
+org_sessions/
+agent_memories.json
+*.db
+paper_portfolio.json
