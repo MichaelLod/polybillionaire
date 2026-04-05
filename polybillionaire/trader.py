@@ -360,7 +360,16 @@ class PaperTrader:
 
 
 class LiveTrader:
-    """Real trading via py-clob-client. Requires private key + API creds."""
+    """Real trading via py-clob-client. Requires private key + API creds.
+
+    Implements the same interface as PaperTrader so the swarm can use
+    either one interchangeably:
+      .bankroll, .positions, .total_value, .risk
+      .buy(token_id, market_question, outcome, size, end_date)
+      .sell(token_id, size)
+      .settle_resolved() -> list[dict]
+      .update_positions(auto_stop) -> list[dict]
+    """
 
     def __init__(
         self,
@@ -395,6 +404,248 @@ class LiveTrader:
             api_passphrase=api_passphrase,
         ))
         self.risk = RiskManager(bankroll=bankroll)
+        self.positions: list[Position] = []
+        self.trades: list[Trade] = []
+        self._client: PolymarketClient | None = None
+
+    @property
+    def bankroll(self) -> float:
+        return self.risk.bankroll
+
+    @property
+    def total_value(self) -> float:
+        return self.bankroll + sum(p.value for p in self.positions)
+
+    def set_client(self, client: PolymarketClient) -> None:
+        """Set the PolymarketClient for price lookups."""
+        self._client = client
+
+    def buy(
+        self,
+        token_id: str,
+        market_question: str,
+        outcome: str,
+        size: float,
+        end_date: str = "",
+    ) -> tuple[bool, str]:
+        """Buy shares at market price via CLOB API."""
+        from py_clob_client.order_builder.constants import BUY
+
+        # Estimate cost from orderbook
+        price = 0.0
+        if self._client:
+            try:
+                book = self._client.get_orderbook(token_id)
+                price = book.best_ask
+            except Exception:
+                pass
+
+        cost = price * size if price > 0 else size * 0.5
+        can, reason = self.risk.can_trade(cost, len(self.positions))
+        if not can:
+            return False, reason
+
+        try:
+            signed = self.clob.create_market_order(
+                self.MarketOrderArgs(
+                    token_id=token_id,
+                    amount=cost,
+                    side=BUY,
+                )
+            )
+            result = self.clob.post_order(signed)
+            if "error" in result:
+                return False, str(result["error"])
+        except Exception as e:
+            return False, f"Order failed: {e}"
+
+        self.risk.update_bankroll(-cost)
+        position = Position(
+            token_id=token_id,
+            market_question=market_question,
+            outcome=outcome,
+            side="BUY",
+            entry_price=price,
+            size=size,
+            cost=cost,
+            current_price=price,
+            end_date=end_date,
+        )
+        self.positions.append(position)
+        self.trades.append(Trade(
+            token_id=token_id,
+            market_question=market_question,
+            outcome=outcome,
+            side="BUY",
+            price=price,
+            size=size,
+            cost=cost,
+            paper=False,
+        ))
+        return True, f"LIVE bought {size:.1f} {outcome} @ ${price:.3f} (cost: ${cost:.2f})"
+
+    def sell(self, token_id: str, size: float | None = None) -> tuple[bool, str]:
+        """Sell shares at market price via CLOB API."""
+        from py_clob_client.order_builder.constants import SELL
+
+        pos = next((p for p in self.positions if p.token_id == token_id), None)
+        if not pos:
+            return False, "No position found"
+
+        sell_size = size or pos.size
+        price = pos.current_price
+
+        try:
+            signed = self.clob.create_market_order(
+                self.MarketOrderArgs(
+                    token_id=token_id,
+                    amount=price * sell_size,
+                    side=SELL,
+                )
+            )
+            result = self.clob.post_order(signed)
+            if "error" in result:
+                return False, str(result["error"])
+        except Exception as e:
+            return False, f"Sell failed: {e}"
+
+        proceeds = price * sell_size
+        pnl = (price - pos.entry_price) * sell_size
+        self.risk.update_bankroll(proceeds)
+        self.trades.append(Trade(
+            token_id=token_id,
+            market_question=pos.market_question,
+            outcome=pos.outcome,
+            side="SELL",
+            price=price,
+            size=sell_size,
+            cost=proceeds,
+            paper=False,
+        ))
+
+        if sell_size >= pos.size:
+            self.positions.remove(pos)
+        else:
+            pos.size -= sell_size
+            pos.cost = pos.entry_price * pos.size
+
+        return True, f"LIVE sold {sell_size:.1f} @ ${price:.3f} (PnL: ${pnl:+.2f})"
+
+    def settle_resolved(self) -> list[dict]:
+        """Check positions for resolved markets. Returns list of settlements."""
+        if not self._client:
+            return []
+        settled: list[dict] = []
+        to_remove: list[Position] = []
+
+        for pos in self.positions:
+            resolved, last_price = self._client.is_market_resolved(pos.token_id)
+            if not resolved:
+                if last_price is not None:
+                    pos.update_pnl(last_price)
+                continue
+
+            won = (last_price or pos.current_price) >= 0.5
+            payout_price = 1.0 if won else 0.0
+            proceeds = payout_price * pos.size
+            pnl = proceeds - pos.cost
+            self.risk.update_bankroll(proceeds)
+            to_remove.append(pos)
+            settled.append({
+                "position": pos,
+                "won": won,
+                "payout_price": payout_price,
+                "proceeds": proceeds,
+                "pnl": pnl,
+                "message": (
+                    f"{'WON' if won else 'LOST'}: {pos.outcome} "
+                    f"\"{pos.market_question[:50]}\" → ${proceeds:.4f} (PnL: ${pnl:+.4f})"
+                ),
+            })
+
+        for pos in to_remove:
+            self.positions.remove(pos)
+        return settled
+
+    def update_positions(self, auto_stop: bool = True) -> list[dict]:
+        """Refresh prices and execute stop-losses."""
+        if not self._client:
+            return []
+        alerts: list[dict] = []
+        to_stop: list[Position] = []
+
+        for pos in self.positions:
+            try:
+                mid = self._client.get_midpoint(pos.token_id)
+                pos.update_pnl(mid)
+                if self.risk.should_stop_loss(pos):
+                    to_stop.append(pos)
+            except Exception:
+                pass
+
+        if auto_stop:
+            for pos in to_stop:
+                ok, msg = self.sell(pos.token_id)
+                alerts.append({
+                    "type": "stop_loss",
+                    "position": pos,
+                    "sold": ok,
+                    "message": f"STOP LOSS: {msg}",
+                })
+        return alerts
+
+    def recover_positions(self) -> int:
+        """Pull existing positions from Polymarket API on startup.
+
+        Returns number of positions recovered.
+        """
+        if not self._client:
+            return 0
+        # Positions live on the proxy address, not the main address
+        address = os.environ.get("POLY_PROXY_ADDRESS", "") or os.environ.get("POLY_ADDRESS", "")
+        if not address:
+            return 0
+        try:
+            raw_positions = self._client.get_positions(address)
+        except Exception:
+            return 0
+
+        recovered = 0
+        for rp in raw_positions:
+            size = float(rp.get("size", 0))
+            if size <= 0:
+                continue
+            # Skip resolved/redeemable positions
+            if rp.get("redeemable", False):
+                continue
+            token_id = rp.get("asset", "")
+            if not token_id:
+                continue
+            # Skip if already tracked
+            if any(p.token_id == token_id for p in self.positions):
+                continue
+            avg_price = float(rp.get("avgPrice", 0))
+            cur_price = float(rp.get("curPrice", 0)) or avg_price
+            current_value = float(rp.get("currentValue", 0))
+            initial_value = float(rp.get("initialValue", 0))
+            market = rp.get("title", "") or "recovered"
+            outcome = rp.get("outcome", "YES")
+            end_date = rp.get("endDate", "")
+            pos = Position(
+                token_id=token_id,
+                market_question=market[:200],
+                outcome=outcome,
+                side="BUY",
+                entry_price=avg_price,
+                size=size,
+                cost=initial_value,
+                current_price=cur_price,
+                end_date=end_date,
+            )
+            pos.update_pnl(cur_price)
+            self.positions.append(pos)
+            recovered += 1
+        return recovered
 
     @classmethod
     def from_env(cls) -> LiveTrader:

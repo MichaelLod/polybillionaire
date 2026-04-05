@@ -182,6 +182,40 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     created_at      REAL NOT NULL DEFAULT (unixepoch('subsec'))
 );
 
+-- Trails: 4th-dimension exploration threads with depth + breadcrumbs.
+-- Agents leave trails as they dive deep into research. Other agents
+-- can pick up abandoned trails and continue the exploration.
+CREATE TABLE IF NOT EXISTS trails (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent           TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    depth           INTEGER NOT NULL DEFAULT 1,
+    breadcrumbs     TEXT NOT NULL DEFAULT '[]',   -- JSON array of steps taken
+    status          TEXT NOT NULL DEFAULT 'exploring'
+                    CHECK (status IN (
+                        'exploring', 'surfaced', 'abandoned', 'picked_up'
+                    )),
+    picked_up_by    TEXT,
+    hypothesis_id   INTEGER REFERENCES hypotheses(id),
+    surfaced_lead_id INTEGER REFERENCES leads(id),
+    created_at      REAL NOT NULL DEFAULT (unixepoch('subsec')),
+    updated_at      REAL NOT NULL DEFAULT (unixepoch('subsec'))
+);
+
+-- Agent events: every LLM call logged for cost tracking (swarm mode).
+CREATE TABLE IF NOT EXISTS agent_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_name      TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    cost_usd        REAL DEFAULT 0,
+    model           TEXT,
+    duration_s      REAL,
+    summary         TEXT,
+    created_at      REAL NOT NULL DEFAULT (unixepoch('subsec'))
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
@@ -190,6 +224,10 @@ CREATE INDEX IF NOT EXISTS idx_research_log_lead ON research_log(lead_id);
 CREATE INDEX IF NOT EXISTS idx_positions_token ON positions(token_id);
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_question ON market_snapshots(market_question);
 CREATE INDEX IF NOT EXISTS idx_hints_status ON hints(status);
+CREATE INDEX IF NOT EXISTS idx_agent_events_agent ON agent_events(agent_name);
+CREATE INDEX IF NOT EXISTS idx_agent_events_time ON agent_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_trails_status ON trails(status);
+CREATE INDEX IF NOT EXISTS idx_trails_agent ON trails(agent);
 """
 
 
@@ -420,6 +458,49 @@ class OrgDB:
                 expired += cur.rowcount
 
         return expired
+
+    # ── Agent Events (cost tracking for swarm) ──────────────────
+
+    def log_agent_event(
+        self,
+        agent_name: str,
+        event_type: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: float = 0.0,
+        model: str = "",
+        duration_s: float = 0.0,
+        summary: str = "",
+    ) -> int:
+        with self._tx() as cur:
+            cur.execute(
+                """INSERT INTO agent_events
+                   (agent_name, event_type, input_tokens, output_tokens,
+                    cost_usd, model, duration_s, summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (agent_name, event_type, input_tokens, output_tokens,
+                 cost_usd, model, duration_s, summary),
+            )
+            return cur.lastrowid  # type: ignore[return-value]
+
+    def get_agent_cost_since(self, agent_name: str, since: float) -> float:
+        """Total USD spent by an agent since a timestamp."""
+        row = self._fetchone(
+            """SELECT COALESCE(SUM(cost_usd), 0) as total
+               FROM agent_events
+               WHERE agent_name = ? AND created_at >= ?""",
+            (agent_name, since),
+        )
+        return row["total"] if row else 0.0
+
+    def get_total_cost_since(self, since: float) -> float:
+        """Total USD spent by all agents since a timestamp."""
+        row = self._fetchone(
+            """SELECT COALESCE(SUM(cost_usd), 0) as total
+               FROM agent_events WHERE created_at >= ?""",
+            (since,),
+        )
+        return row["total"] if row else 0.0
 
     # ── Research Log ───────────────────────────────────────────
 
@@ -654,6 +735,129 @@ class OrgDB:
             (market_question, limit),
         )
 
+    # ── Trails (4th dimension) ────────────────────────────────
+
+    def start_trail(self, agent: str, topic: str,
+                    hypothesis_id: int | None = None) -> int:
+        """Begin a new exploration trail."""
+        import json
+        with self._tx() as cur:
+            cur.execute(
+                """INSERT INTO trails
+                   (agent, topic, depth, breadcrumbs, hypothesis_id)
+                   VALUES (?, ?, 1, ?, ?)""",
+                (agent, topic, json.dumps([]), hypothesis_id),
+            )
+            return cur.lastrowid  # type: ignore[return-value]
+
+    def deepen_trail(self, trail_id: int, breadcrumb: str) -> int:
+        """Go deeper — append a breadcrumb and increment depth.
+
+        Returns the new depth.
+        """
+        import json
+        trail = self._fetchone("SELECT * FROM trails WHERE id = ?", (trail_id,))
+        if not trail:
+            return 0
+        crumbs = json.loads(trail["breadcrumbs"] or "[]")
+        crumbs.append(breadcrumb)
+        new_depth = trail["depth"] + 1
+        with self._tx() as cur:
+            cur.execute(
+                """UPDATE trails
+                   SET depth = ?, breadcrumbs = ?, updated_at = ?
+                   WHERE id = ?""",
+                (new_depth, json.dumps(crumbs), time.time(), trail_id),
+            )
+        return new_depth
+
+    def surface_trail(self, trail_id: int, lead_id: int | None = None) -> None:
+        """Agent found edge — come forth from the 4th dimension."""
+        with self._tx() as cur:
+            cur.execute(
+                """UPDATE trails
+                   SET status = 'surfaced', surfaced_lead_id = ?, updated_at = ?
+                   WHERE id = ?""",
+                (lead_id, time.time(), trail_id),
+            )
+
+    def abandon_trail(self, trail_id: int) -> None:
+        """Agent moves on — trail is left for others to pick up."""
+        with self._tx() as cur:
+            cur.execute(
+                """UPDATE trails
+                   SET status = 'abandoned', updated_at = ?
+                   WHERE id = ?""",
+                (time.time(), trail_id),
+            )
+
+    def pick_up_trail(self, trail_id: int, agent: str) -> dict | None:
+        """Another agent picks up an abandoned trail and continues."""
+        trail = self._fetchone(
+            "SELECT * FROM trails WHERE id = ? AND status = 'abandoned'",
+            (trail_id,),
+        )
+        if not trail:
+            return None
+        with self._tx() as cur:
+            cur.execute(
+                """UPDATE trails
+                   SET status = 'picked_up', picked_up_by = ?, updated_at = ?
+                   WHERE id = ?""",
+                (agent, time.time(), trail_id),
+            )
+        # Start a continuation trail
+        import json
+        crumbs = json.loads(trail["breadcrumbs"] or "[]")
+        with self._tx() as cur:
+            cur.execute(
+                """INSERT INTO trails
+                   (agent, topic, depth, breadcrumbs, hypothesis_id)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (agent, trail["topic"], trail["depth"],
+                 json.dumps(crumbs), trail["hypothesis_id"]),
+            )
+        return trail
+
+    def get_abandoned_trails(self, exclude_agent: str = "",
+                             limit: int = 5) -> list[dict]:
+        """Find trails left behind by other agents — ripe for pickup."""
+        if exclude_agent:
+            return self._fetchall(
+                """SELECT * FROM trails
+                   WHERE status = 'abandoned' AND agent != ?
+                   ORDER BY depth DESC, updated_at DESC
+                   LIMIT ?""",
+                (exclude_agent, limit),
+            )
+        return self._fetchall(
+            """SELECT * FROM trails
+               WHERE status = 'abandoned'
+               ORDER BY depth DESC, updated_at DESC
+               LIMIT ?""",
+            (limit,),
+        )
+
+    def get_agent_active_trail(self, agent: str) -> dict | None:
+        """Get the trail an agent is currently exploring."""
+        return self._fetchone(
+            """SELECT * FROM trails
+               WHERE agent = ? AND status = 'exploring'
+               ORDER BY updated_at DESC LIMIT 1""",
+            (agent,),
+        )
+
+    def expire_old_trails(self, max_age_hours: float = 12) -> int:
+        """Auto-abandon trails that have gone cold."""
+        cutoff = time.time() - (max_age_hours * 3600)
+        with self._tx() as cur:
+            cur.execute(
+                """UPDATE trails SET status = 'abandoned', updated_at = ?
+                   WHERE status = 'exploring' AND updated_at < ?""",
+                (time.time(), cutoff),
+            )
+            return cur.rowcount
+
     # ── Context builders for agent prompts ─────────────────────
 
     def build_ceo_context(self) -> str:
@@ -728,6 +932,23 @@ class OrgDB:
         if hyps:
             lines = [f"  - {h['title']}: {h['thesis'][:100]}" for h in hyps[:5]]
             parts.append("== HYPOTHESES NEEDING EVIDENCE ==\n" + "\n".join(lines))
+
+        # Abandoned trails from other agents — available for pickup
+        abandoned = self.get_abandoned_trails(limit=3)
+        if abandoned:
+            import json
+            lines = []
+            for t in abandoned:
+                crumbs = json.loads(t["breadcrumbs"] or "[]")
+                last_crumb = crumbs[-1][:80] if crumbs else "no breadcrumbs"
+                lines.append(
+                    f"  - [depth {t['depth']}] {t['topic'][:80]} "
+                    f"(by {t['agent']}, last: {last_crumb})"
+                )
+            parts.append(
+                "== ABANDONED TRAILS (pick up to continue) ==\n"
+                + "\n".join(lines)
+            )
 
         return "\n\n".join(parts) if parts else ""
 

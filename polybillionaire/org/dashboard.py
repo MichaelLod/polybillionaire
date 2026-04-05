@@ -94,6 +94,111 @@ def _color(name: str) -> str:
     return AGENT_COLORS.get(name, AGENT_COLORS.get(name.split("-")[0], "white"))
 
 
+# ── Ship classes ─────────────────────────────────────────────────────────────
+# Each ship class maps to an agent type. Sprites use block elements for a
+# half-block pixel art look. Ships face right (→) for scouts/interceptors,
+# upward (↑) for probes, or are symmetric for stations.
+
+@dataclass
+class ShipClass:
+    """Definition of a fleet ship class."""
+    key: str           # deploy keybind (lowercase)
+    label: str         # display name
+    agent_prefix: str  # agent name prefix (e.g. "Scanner", "Diver")
+    max_count: int     # max deployable
+    color: str         # base color
+    sprite: list[str]  # ASCII art lines (centered)
+    exhaust: str       # exhaust character pattern
+
+
+# Sprites designed with block elements — each is ~5-7 lines tall, <16 wide
+# Using: █ ▓ ▒ ░ ▀ ▄ ▌ ▐ ► ◄ ▸ ◂ ◆ ◈
+
+SHIP_SPRITES: dict[str, list[str]] = {
+    "scout": [          # Scanner — fast corvette, faces right
+        "   ░▒▓█►  ",
+        "  ▒▓████▓▸",
+        " ░▓██████►",
+        "  ▒▓████▓▸",
+        "   ░▒▓█►  ",
+    ],
+    "probe": [          # Diver — torpedo, faces down for diving
+        "    ▄█▄    ",
+        "   ▐███▌   ",
+        "   ▐█▓█▌   ",
+        "    ▓▒▓    ",
+        "    ░▒░    ",
+        "     ▀     ",
+    ],
+    "interceptor": [    # Contrarian — angular attack ship
+        "  █▓░ ░▓█  ",
+        "   ▓███▓   ",
+        "  ▒█████▒  ",
+        "   ▓███▓   ",
+        "  █▓░ ░▓█  ",
+    ],
+    "battlecruiser": [  # Reasoning — heavy capital ship
+        "  ░▒▓████▓▒░  ",
+        "   ▓██████▓   ",
+        "  ▒████████▒  ",
+        "   ▓██████▓   ",
+        "  ░▒▓████▓▒░  ",
+    ],
+    "mothership": [     # System — central station, always present
+        "    ▄███▄    ",
+        "  ░▓█████▓░  ",
+        "  ▒███████▒  ",
+        "  ░▓█████▓░  ",
+        "    ▀███▀    ",
+    ],
+    "beacon": [         # Inspiration — pulsing signal tower
+        "     ░     ",
+        "    ▒█▒    ",
+        "   ░▓█▓░   ",
+        "    ▒█▒    ",
+        "     ░     ",
+    ],
+}
+
+SHIP_CLASSES: dict[str, ShipClass] = {
+    "scout": ShipClass(
+        key="s", label="Scout", agent_prefix="Scanner",
+        max_count=4, color="cyan", exhaust="·∘○",
+        sprite=SHIP_SPRITES["scout"],
+    ),
+    "probe": ShipClass(
+        key="d", label="Probe", agent_prefix="Diver",
+        max_count=7, color="green", exhaust="░▒▓",
+        sprite=SHIP_SPRITES["probe"],
+    ),
+    "interceptor": ShipClass(
+        key="c", label="Interceptor", agent_prefix="Contrarian",
+        max_count=2, color="red", exhaust="·•●",
+        sprite=SHIP_SPRITES["interceptor"],
+    ),
+    "battlecruiser": ShipClass(
+        key="r", label="Battlecruiser", agent_prefix="Reasoning",
+        max_count=1, color="yellow", exhaust="═══",
+        sprite=SHIP_SPRITES["battlecruiser"],
+    ),
+}
+
+# Map agent name prefix → ship class key
+AGENT_SHIP_MAP: dict[str, str] = {
+    "Scanner": "scout",
+    "Diver": "probe",
+    "Contrarian": "interceptor",
+    "Reasoning": "battlecruiser",
+    "System": "mothership",
+    "Monitor": "mothership",
+    "Inspiration": "beacon",
+}
+
+# Deploy order for scanners (each deploy picks the next type)
+SCANNER_ORDER = [
+    "Scanner-Sports", "Scanner-Politics", "Scanner-Crypto", "Scanner-News",
+]
+
 # ── Data classes ─────────────────────────────────────────────────────────────
 
 
@@ -143,11 +248,9 @@ class Dashboard:
 
         self._research_names = [f"Research-{i + 1}" for i in range(num_researchers)]
         self._all_agent_names = [
-            "CEO", *self._research_names, "Reasoning", "Trader",
+            *self._research_names, "Reasoning", "Trader",
         ]
-        self.agents: dict[str, AgentStatus] = {
-            n: AgentStatus() for n in self._all_agent_names
-        }
+        self.agents: dict[str, AgentStatus] = {}
         self.messages: list[Message] = []
         self.portfolio: dict[str, float | int] = {
             "bankroll": 0.0, "deployed": 0.0,
@@ -160,9 +263,27 @@ class Dashboard:
         self._footer_extra = ""
         self._live: Live | None = None
 
-        # View mode: "feed" | "positions" | "hypotheses"
-        self._view_mode = "feed"
+        # View mode: "balls" | "feed" | "positions" | "hypotheses"
+        self._view_mode = "balls"
+        self._selected_agent: str | None = None
         self._selected_index = 0
+        self._burst_frames: dict[str, int] = {}  # finding burst animation
+        self._agent_grid_pos: dict[str, tuple[int, int]] = {}  # (gx, gy) grid coords
+
+        # 4th dimension trail state — cached from DB
+        self._trail_cache: dict[str, dict] = {}  # agent -> {depth, status, topic}
+        self._trail_cache_frame = 0  # last frame we refreshed
+        self._surface_burst: dict[str, int] = {}  # agent -> frames remaining
+        self._particle_trails: list[tuple[int, int, int, str]] = []  # (x, y, ttl, color)
+
+        # Fleet command — swarm reference set after construction
+        self.swarm: object | None = None  # set to Swarm instance by cli.py
+        self._projectiles: list[dict] = []  # {x, y, tx, ty, ttl, char, color}
+
+        # Parallax starfield — 3 layers seeded once
+        import random as _rng
+        self._stars: list[tuple[int, int, int]] = []  # (x, y, layer)
+        self._stars_seeded = False
 
         # Hint input mode — when True, all keystrokes go to hint buffer
         self._input_mode = False
@@ -177,13 +298,9 @@ class Dashboard:
         self._last_output: dict[str, str] = {}
         self._window_scroll: dict[str, int] = {}
 
-        # Key mapping: number keys -> agent names
+        # Key mapping: number keys -> agent names (rebuilt dynamically)
         self._key_to_agent: dict[str, str] = {}
         self._agent_to_key: dict[str, str] = {}
-        for i, name in enumerate(self._all_agent_names):
-            key = str(i + 1)
-            self._key_to_agent[key] = name
-            self._agent_to_key[name] = key
 
         # Power mode — burns tokens faster for aggressive trading
         self.power_mode = False
@@ -296,19 +413,32 @@ class Dashboard:
                     self.power_mode = not self.power_mode
                     continue
 
+                # Fleet deploy (lowercase) / recall (uppercase)
+                deploy_keys = {sc.key: k for k, sc in SHIP_CLASSES.items()}
+                recall_keys = {sc.key.upper(): k for k, sc in SHIP_CLASSES.items()}
+                if ch in deploy_keys:
+                    self._deploy_ship(deploy_keys[ch])
+                    continue
+                if ch in recall_keys:
+                    self._recall_ship(recall_keys[ch])
+                    continue
+
                 # "i" enters hint input mode
                 if ch == "i":
                     self._input_mode = True
                     self._input_buffer = ""
                     continue
 
-                # View mode switching
+                # View mode switching (toggle: press again to return to balls)
                 if ch in ("f", "p", "h"):
+                    target = {"f": "feed", "p": "positions", "h": "hypotheses"}[ch]
+                    self._selected_agent = None
                     self._open_windows.clear()
                     self._window_scroll.clear()
-                    self._view_mode = {
-                        "f": "feed", "p": "positions", "h": "hypotheses",
-                    }[ch]
+                    if self._view_mode == target:
+                        self._view_mode = "balls"
+                    else:
+                        self._view_mode = target
                     self._selected_index = 0
                     continue
 
@@ -320,16 +450,14 @@ class Dashboard:
                     self._selected_index = max(0, self._selected_index - 1)
                     continue
 
-                # Number keys toggle agent windows
+                # Number keys select/expand agent balls
                 if ch in self._key_to_agent:
                     name = self._key_to_agent[ch]
-                    self._view_mode = "feed"
-                    if name in self._open_windows:
-                        self._open_windows.remove(name)
-                        self._window_scroll.pop(name, None)
+                    if self._selected_agent == name:
+                        self._selected_agent = None  # deselect
                     else:
-                        self._open_windows.append(name)
-                        self._window_scroll[name] = 999999
+                        self._selected_agent = name
+                    self._view_mode = "balls"
                     continue
 
                 # Escape sequence handling
@@ -354,10 +482,11 @@ class Dashboard:
                                 elif ch3 == "B":  # Down
                                     self._selected_index += 1
                     else:
-                        # Standalone Escape — back to feed
+                        # Standalone Escape — back to ball grid
                         self._open_windows.clear()
                         self._window_scroll.clear()
-                        self._view_mode = "feed"
+                        self._selected_agent = None
+                        self._view_mode = "balls"
                         self._selected_index = 0
                     continue
         except (EOFError, OSError):
@@ -389,10 +518,144 @@ class Dashboard:
             for name in self.agents:
                 if name != msg.sender:
                     self._active_flows[f"{msg.sender}->{name}"] = 10
+        # Trigger burst glow on findings
+        if msg.kind == "finding":
+            self._burst_frames[msg.sender] = 8
+            # If this agent was diving, trigger a dramatic surface burst
+            if msg.sender in self._trail_cache:
+                self._surface_burst[msg.sender] = 16
+            # Fire data projectile toward Reasoning (battlecruiser)
+            sender_pos = self._agent_grid_pos.get(msg.sender)
+            reasoning_pos = None
+            for aname in self.agents:
+                if aname.startswith("Reasoning"):
+                    reasoning_pos = self._agent_grid_pos.get(aname)
+                    break
+            if sender_pos and reasoning_pos:
+                sx = sender_pos[0] * 18 + 9
+                sy = sender_pos[1] * 9 + 4
+                tx = reasoning_pos[0] * 18 + 9
+                ty = reasoning_pos[1] * 9 + 4
+                self._projectiles.append({
+                    "x": float(sx), "y": float(sy),
+                    "tx": float(tx), "ty": float(ty),
+                    "ttl": 20, "char": "◆", "color": "bold cyan",
+                })
 
     def _ensure_agent(self, name: str) -> None:
         if name not in self.agents:
             self.agents[name] = AgentStatus()
+            # Auto-assign next available number key
+            for k in "123456789":
+                if k not in self._key_to_agent:
+                    self._key_to_agent[k] = name
+                    self._agent_to_key[name] = k
+                    break
+            # Auto-place on grid canvas
+            if name not in self._agent_grid_pos:
+                self._auto_place_agent(name)
+
+    def _auto_place_agent(self, name: str) -> None:
+        """Place a new agent at the next free grid position."""
+        occupied = set(self._agent_grid_pos.values())
+        # Spiral outward from center to find free spot
+        # Grid coords: (0,0) is top-left of the grid
+        max_cols, max_rows = 6, 4
+        for gy in range(max_rows):
+            for gx in range(max_cols):
+                if (gx, gy) not in occupied:
+                    self._agent_grid_pos[name] = (gx, gy)
+                    return
+        # Fallback: stack at (0, 0)
+        self._agent_grid_pos[name] = (0, 0)
+
+    # ── Fleet command ───────────────────────────────────────────
+
+    def _get_ship_class(self, name: str) -> str | None:
+        """Map an agent name to its ship class key."""
+        prefix = name.split("-")[0]
+        return AGENT_SHIP_MAP.get(prefix)
+
+    def _fleet_counts(self) -> dict[str, int]:
+        """Count deployed ships per class."""
+        counts: dict[str, int] = {}
+        for name in self.agents:
+            sc = self._get_ship_class(name)
+            if sc and sc in SHIP_CLASSES:
+                counts[sc] = counts.get(sc, 0) + 1
+        return counts
+
+    def _deploy_ship(self, class_key: str) -> None:
+        """Deploy one ship of the given class via swarm."""
+        if not self.swarm:
+            self._footer_extra = "No swarm connected"
+            return
+        sc = SHIP_CLASSES.get(class_key)
+        if not sc:
+            return
+        # Check max count
+        current = self._fleet_counts().get(class_key, 0)
+        if current >= sc.max_count:
+            self._footer_extra = f"{sc.label} fleet full ({sc.max_count}/{sc.max_count})"
+            return
+        # Find the right config to spawn
+        from .agent_config import POWER_CONFIGS
+        import copy
+        # For scouts, deploy in order: Sports→Politics→Crypto→News
+        if class_key == "scout":
+            deployed_scanners = [
+                n for n in self.agents if n.startswith("Scanner-")
+            ]
+            for scanner_name in SCANNER_ORDER:
+                if scanner_name not in deployed_scanners:
+                    cfg = next(
+                        (c for c in POWER_CONFIGS if c.name == scanner_name),
+                        None,
+                    )
+                    if cfg:
+                        self.swarm.spawn_agent(copy.deepcopy(cfg))
+                        self._footer_extra = f"Deployed {scanner_name}"
+                        return
+            self._footer_extra = "All scanners deployed"
+            return
+        # For others, find a matching config template
+        for cfg in POWER_CONFIGS:
+            if cfg.name.startswith(sc.agent_prefix):
+                # Check if this specific one is already deployed
+                if cfg.name not in self.agents:
+                    self.swarm.spawn_agent(copy.deepcopy(cfg))
+                    self._footer_extra = f"Deployed {cfg.name}"
+                    return
+        self._footer_extra = f"No more {sc.label}s available"
+
+    def _recall_ship(self, class_key: str) -> None:
+        """Recall (kill) the most recently deployed ship of this class."""
+        if not self.swarm:
+            self._footer_extra = "No swarm connected"
+            return
+        sc = SHIP_CLASSES.get(class_key)
+        if not sc:
+            return
+        # Find deployed agents of this class (reverse order = recall newest)
+        deployed = [
+            n for n in reversed(list(self.agents.keys()))
+            if self._get_ship_class(n) == class_key
+        ]
+        if not deployed:
+            self._footer_extra = f"No {sc.label}s deployed"
+            return
+        name = deployed[0]
+        self.swarm.kill_agent(name)
+        # Remove from dashboard state
+        if name in self.agents:
+            del self.agents[name]
+        if name in self._agent_grid_pos:
+            del self._agent_grid_pos[name]
+        if name in self._key_to_agent.values():
+            key = self._agent_to_key.pop(name, None)
+            if key:
+                self._key_to_agent.pop(key, None)
+        self._footer_extra = f"Recalled {name}"
 
     def agent_thinking(self, name: str) -> None:
         self._ensure_agent(name)
@@ -482,10 +745,63 @@ class Dashboard:
             del self._active_flows[k]
         for k in list(self._active_flows):
             self._active_flows[k] -= 1
+        # Decay finding burst animations
+        burst_done = [k for k, v in self._burst_frames.items() if v <= 0]
+        for k in burst_done:
+            del self._burst_frames[k]
+        for k in list(self._burst_frames):
+            self._burst_frames[k] -= 1
         if self._sell_result_ttl > 0:
             self._sell_result_ttl -= 1
             if self._sell_result_ttl <= 0:
                 self._sell_result = None
+        # Decay surface burst
+        sb_done = [k for k, v in self._surface_burst.items() if v <= 0]
+        for k in sb_done:
+            del self._surface_burst[k]
+        for k in list(self._surface_burst):
+            self._surface_burst[k] -= 1
+        # Decay particle trails
+        self._particle_trails = [
+            (x, y, ttl - 1, c) for x, y, ttl, c in self._particle_trails if ttl > 1
+        ]
+        # Advance projectiles toward target
+        import math as _m
+        alive = []
+        for proj in self._projectiles:
+            proj["ttl"] -= 1
+            if proj["ttl"] <= 0:
+                continue
+            dx = proj["tx"] - proj["x"]
+            dy = proj["ty"] - proj["y"]
+            dist = _m.sqrt(dx * dx + dy * dy)
+            if dist < 2:
+                continue  # arrived
+            speed = 3.0
+            proj["x"] += dx / dist * speed
+            proj["y"] += dy / dist * speed * 0.5  # half speed vertical (aspect)
+            alive.append(proj)
+        self._projectiles = alive
+        # Refresh trail cache from DB every ~8 frames (2 sec at 4fps)
+        if self.db and self._frame - self._trail_cache_frame >= 8:
+            self._trail_cache_frame = self._frame
+            old_cache = dict(self._trail_cache)
+            self._trail_cache.clear()
+            for name in list(self.agents.keys()):
+                try:
+                    trail = self.db.get_agent_active_trail(name)
+                    if trail:
+                        self._trail_cache[name] = {
+                            "depth": trail["depth"],
+                            "status": trail["status"],
+                            "topic": trail.get("topic", ""),
+                        }
+                except Exception:
+                    pass
+            # Detect agents that just surfaced (were in old cache, not in new)
+            for name, old in old_cache.items():
+                if name not in self._trail_cache and old.get("status") == "exploring":
+                    self._surface_burst[name] = 16
 
     # ── Layout ──────────────────────────────────────────────────
 
@@ -496,27 +812,12 @@ class Dashboard:
             Layout(name="sidebar", size=34),
         )
 
-        org_height = max(8, len(self._research_names) + 5)
-
         main_parts: list[Layout] = [
             Layout(name="header", size=3),
-            Layout(name="org", size=org_height),
-            Layout(name="status", size=1),
+            Layout(name="content", ratio=1, minimum_size=8),
+            Layout(name="fleet", size=3),
+            Layout(name="footer", size=1),
         ]
-
-        if self._open_windows:
-            for wname in self._open_windows:
-                main_parts.append(Layout(name=f"win_{wname}", ratio=1))
-        elif self._view_mode == "positions":
-            main_parts.append(Layout(name="positions", ratio=1, minimum_size=10))
-        elif self._view_mode == "hypotheses":
-            main_parts.append(Layout(name="hypotheses", ratio=1, minimum_size=10))
-        else:
-            # Default: feed + live agent output side by side
-            feed_row = Layout(name="feed_row", ratio=1, minimum_size=8)
-            main_parts.append(feed_row)
-
-        main_parts.append(Layout(name="footer", size=1))
         layout["main"].split_column(*main_parts)
 
         layout["sidebar"].split_column(
@@ -524,58 +825,93 @@ class Dashboard:
             Layout(name="hints", ratio=2, minimum_size=8),
         )
 
-        # Populate
+        # Populate header / fleet / footer / sidebar
         layout["header"].update(self._hdr())
-        layout["org"].update(self._org())
-        layout["status"].update(self._status_line())
+        layout["fleet"].update(self._fleet_panel())
+        layout["footer"].update(self._ftr())
+        layout["memory"].update(self._memory_panel())
+        layout["hints"].update(self._hints_panel())
 
-        if self._open_windows:
-            for wname in self._open_windows:
-                layout[f"win_{wname}"].update(self._agent_window(wname))
-        elif self._view_mode == "positions":
-            layout["positions"].update(self._positions_view())
-        elif self._view_mode == "hypotheses":
-            layout["hypotheses"].update(self._hypotheses_view())
-        else:
-            # Split feed row: activity feed + live agent output
+        # Main content: ball grid handles both normal + selected agent views
+        if self._view_mode == "feed":
             active_agent = self._most_active_agent()
             if active_agent:
-                layout["feed_row"].split_row(
+                layout["content"].split_row(
                     Layout(name="feed", ratio=1),
                     Layout(name="live_agent", ratio=1),
                 )
                 layout["feed"].update(self._feed())
                 layout["live_agent"].update(self._live_agent_panel(active_agent))
             else:
-                layout["feed_row"].update(self._feed())
-
-        layout["footer"].update(self._ftr())
-        layout["memory"].update(self._memory_panel())
-        layout["hints"].update(self._hints_panel())
+                layout["content"].update(self._feed())
+        elif self._view_mode == "positions":
+            layout["content"].update(self._positions_view())
+        elif self._view_mode == "hypotheses":
+            layout["content"].update(self._hypotheses_view())
+        else:
+            # Default: space fleet view
+            layout["content"].update(self._ball_grid())
 
         return layout
+
+    def _fleet_panel(self) -> Panel:
+        """Bottom fleet command bar showing ship counts and deploy keybinds."""
+        counts = self._fleet_counts()
+        parts = []
+        for key, sc in SHIP_CLASSES.items():
+            cur = counts.get(key, 0)
+            max_c = sc.max_count
+            if cur > 0:
+                bar = "█" * cur + "░" * (max_c - cur)
+                style = f"bold {sc.color}"
+            else:
+                bar = "░" * max_c
+                style = "dim"
+            parts.append(
+                f"[{style}]{sc.key.upper()}[/{style}] "
+                f"[bold]{sc.label}[/bold] "
+                f"[{style}]{bar}[/{style}] "
+                f"{cur}/{max_c}"
+            )
+        fleet_str = "  │  ".join(parts)
+        total = sum(counts.values())
+        total_max = sum(sc.max_count for sc in SHIP_CLASSES.values())
+        extra = ""
+        if self._footer_extra:
+            extra = f"  [dim]│  {self._footer_extra}[/dim]"
+        return Panel(
+            Text.from_markup(
+                f"  {fleet_str}  [dim]│[/dim]  "
+                f"Fleet [bold]{total}[/bold]/{total_max}{extra}"
+            ),
+            title="[bold]FLEET COMMAND[/bold]",
+            title_align="left",
+            border_style="dim yellow",
+            padding=(0, 1),
+        )
 
     # ── Header ──────────────────────────────────────────────────
 
     def _hdr(self) -> Panel:
-        c = self.cycle
-        total = f"/{self.total_cycles}" if self.total_cycles else ""
         p = self.portfolio
         ps = "green" if p["pnl"] >= 0 else "red"
         total_tok = sum(
             a.input_tokens + a.output_tokens for a in self.agents.values()
         )
         tok_part = f"  |  Tokens [dim]{total_tok:,}[/dim]" if total_tok else ""
+        n_agents = sum(1 for a in self.agents.values() if a.status != "idle" or a.input_tokens > 0)
         mode_badge = (
             "  [bold red]POWER[/bold red]" if self.power_mode
             else ""
         )
         return Panel(
             Text.from_markup(
-                f"[bold cyan]POLYBILLIONAIRE TRADING ORG[/bold cyan]{mode_badge}   "
-                f"Cycle [bold]{c}{total}[/bold]  |  "
-                f"Bankroll [bold]${p['bankroll']:.2f}[/bold]  |  "
-                f"Positions [bold]{p['positions']}[/bold]  |  "
+                f"[bold cyan]POLYBILLIONAIRE[/bold cyan]{mode_badge}   "
+                f"Agents [bold]{n_agents}[/bold]  |  "
+                f"Portfolio [bold]${p['value']:.2f}[/bold]  |  "
+                f"Free [bold]${p['bankroll']:.2f}[/bold]  |  "
+                f"In Positions [bold]${p['value'] - p['bankroll']:.2f}[/bold] "
+                f"({p['positions']} open)  |  "
                 f"P&L [{ps}]${p['pnl']:+.4f}[/{ps}]{tok_part}"
             ),
             style="cyan",
@@ -601,108 +937,270 @@ class Dashboard:
             return Text.from_markup(f"  [dim]{self._footer_extra}[/dim]")
         return Text.from_markup("  [dim]Idle[/dim]")
 
-    # ── Org chart ───────────────────────────────────────────────
+    # ── Ship renderer ────────────────────────────────────────────
 
-    def _org(self) -> Panel:
-        table = Table(
-            show_header=False, show_edge=False, box=None,
-            padding=0, expand=True,
+    _STATUS_COLORS = {
+        "idle": "white", "thinking": "yellow", "working": "green",
+        "cooldown": "blue", "done": "green", "error": "red",
+    }
+
+    def _seed_stars(self, w: int, h: int) -> None:
+        """Seed the parallax starfield once. 3 layers at different densities."""
+        import random
+        rng = random.Random(42)
+        self._stars = []
+        # Layer 0 (far, dim, dense): ~3% fill
+        for _ in range(int(w * h * 0.025)):
+            self._stars.append((rng.randint(0, w - 1), rng.randint(0, h - 1), 0))
+        # Layer 1 (mid): ~1.5%
+        for _ in range(int(w * h * 0.012)):
+            self._stars.append((rng.randint(0, w - 1), rng.randint(0, h - 1), 1))
+        # Layer 2 (near, bright, sparse): ~0.4%
+        for _ in range(int(w * h * 0.004)):
+            self._stars.append((rng.randint(0, w - 1), rng.randint(0, h - 1), 2))
+        self._stars_seeded = True
+
+    def _ball_grid(self) -> Panel:
+        """Space Fleet Command — ships float in a parallax starfield.
+        Each agent is rendered as its ship class sprite. Active ships
+        show engine exhaust. Findings trigger projectile animations.
+        """
+        import math
+
+        sidebar_w = 36
+        canvas_w = max(30, self.console.width - sidebar_w)
+        canvas_h = max(8, self.console.height - 10)  # leave room for fleet panel
+        t = self._frame * 0.3
+
+        # Seed starfield on first render or resize
+        if not self._stars_seeded:
+            self._seed_stars(canvas_w, canvas_h)
+
+        # Ship sprite dimensions
+        sprite_h = 5  # all sprites are 5-6 lines
+        cell_w = 18
+        cell_h = sprite_h + 4
+
+        # ── Compute ship positions ─────────────────────────────
+        agent_positions: dict[str, tuple[int, int]] = {}  # name -> (px, py)
+        agent_colors: dict[str, str] = {}
+        selected = self._selected_agent
+        center_x, center_y = canvas_w // 2, (canvas_h - 4) // 2
+
+        for name in sorted(self.agents.keys()):
+            st = self.agents.get(name, AgentStatus())
+            gx, gy = self._agent_grid_pos.get(name, (0, 0))
+
+            base_x = gx * cell_w + cell_w // 2
+            base_y = gy * cell_h + cell_h // 2
+
+            # Drift — each ship has unique orbital motion
+            phase = hash(name) % 100 * 0.0628
+            active = st.status in ("thinking", "working")
+            speed = 0.6 if active else 0.3
+            amp_x = 4 if active else 2
+            amp_y = 1.5 if active else 0.8
+            drift_x = math.sin(t * speed + phase) * amp_x
+            drift_y = math.cos(t * speed * 0.7 + phase * 1.3) * amp_y
+            drift_x += math.sin(t * 1.1 + phase * 2.7) * 1.2
+            drift_y += math.cos(t * 0.8 + phase * 3.1) * 0.5
+
+            if selected == name:
+                px = center_x
+                py = center_y - 2
+            elif selected:
+                dx_from_center = base_x - center_x
+                dy_from_center = base_y - center_y
+                px = int(center_x + dx_from_center * 1.3 + drift_x)
+                py = int(center_y + dy_from_center * 1.3 + drift_y)
+            else:
+                px = int(base_x + drift_x)
+                py = int(base_y + drift_y)
+
+            # Resolve ship color
+            ship_key = self._get_ship_class(name)
+            sc = SHIP_CLASSES.get(ship_key or "")
+            base_color = sc.color if sc else "white"
+            if self._surface_burst.get(name, 0) > 0:
+                color = "bold bright_white"
+            elif active:
+                color = f"bold {base_color}"
+            elif st.status == "idle" and (st.input_tokens + st.output_tokens) == 0:
+                color = f"dim {base_color}"
+            else:
+                color = base_color
+            agent_colors[name] = color
+            agent_positions[name] = (px, py)
+
+            # Engine exhaust particles for active ships
+            if active and self._frame % 3 == 0:
+                ex = px - 2 if ship_key in ("scout", "battlecruiser") else px
+                ey = py + 3 if ship_key == "probe" else py
+                self._particle_trails.append((ex, ey, 12, base_color))
+
+        # ── Build 2D canvas ────────────────────────────────────
+        chars = [[" "] * canvas_w for _ in range(canvas_h)]
+        styles = [[""] * canvas_w for _ in range(canvas_h)]
+
+        # ── Parallax starfield ─────────────────────────────────
+        star_chars = [".", "·", "*"]
+        star_styles = ["bright_black", "dim", "bold white"]
+        star_speeds = [0.15, 0.35, 0.7]
+        for sx, sy, layer in self._stars:
+            # Parallax drift — each layer scrolls at different speed
+            drift = int(t * star_speeds[layer])
+            dx = (sx + drift) % canvas_w
+            dy = sy % canvas_h
+            if 0 <= dx < canvas_w and 0 <= dy < canvas_h:
+                # Twinkle: some stars blink
+                if layer == 2:
+                    twinkle = math.sin(t * 2.0 + sx * 0.3 + sy * 0.7)
+                    if twinkle < -0.3:
+                        continue  # star blinks off
+                    if twinkle > 0.7:
+                        chars[dy][dx] = "✦"
+                        styles[dy][dx] = "bold cyan"
+                        continue
+                chars[dy][dx] = star_chars[layer]
+                styles[dy][dx] = star_styles[layer]
+
+        # ── Render exhaust particle trails ─────────────────────
+        for px, py, ttl, pc in self._particle_trails:
+            if 0 <= px < canvas_w and 0 <= py < canvas_h:
+                fade = ttl / 12.0
+                if fade > 0.7:
+                    chars[py][px] = "░"
+                    styles[py][px] = pc
+                elif fade > 0.4:
+                    chars[py][px] = "·"
+                    styles[py][px] = f"dim {pc}"
+                elif fade > 0.15:
+                    chars[py][px] = "."
+                    styles[py][px] = "bright_black"
+
+        # ── Render projectiles ─────────────────────────────────
+        for proj in self._projectiles:
+            px, py = int(proj["x"]), int(proj["y"])
+            if 0 <= px < canvas_w and 0 <= py < canvas_h:
+                chars[py][px] = proj["char"]
+                styles[py][px] = proj["color"]
+
+        # ── Stamp ship sprites ─────────────────────────────────
+        render_order = sorted(
+            agent_positions.keys(),
+            key=lambda n: (n == selected,),
         )
-        table.add_column(ratio=2, vertical="middle")
-        table.add_column(ratio=1, vertical="middle", justify="center")
-        table.add_column(ratio=3, vertical="middle")
-        table.add_column(ratio=1, vertical="middle", justify="center")
-        table.add_column(ratio=2, vertical="middle")
-        table.add_column(ratio=1, vertical="middle", justify="center")
-        table.add_column(ratio=2, vertical="middle")
 
-        table.add_row(
-            self._card("CEO"),
-            self._arrow("CEO", "Research"),
-            self._research_pool(),
-            self._arrow("Research", "Reasoning"),
-            self._card("Reasoning"),
-            self._arrow("Reasoning", "Trader"),
-            self._card("Trader"),
-        )
-        return Panel(
-            table,
-            title="[bold]Organization[/bold]",
-            border_style="cyan",
-            padding=(0, 1),
-        )
+        for name in render_order:
+            st = self.agents.get(name, AgentStatus())
+            color = agent_colors.get(name, "white")
+            ax, ay = agent_positions[name]
+            is_fore = name == selected
+            is_dim = selected and not is_fore
+            sb = self._surface_burst.get(name, 0)
 
-    def _card(self, name: str) -> Panel:
-        st = self.agents.get(name, AgentStatus())
-        color = _color(name)
-        dot = STATUS_DOT.get(st.status, STATUS_DOT["idle"])
-        act = (st.activity or st.status)[:12]
-        tok = st.input_tokens + st.output_tokens
-        tok_str = f"{tok:,}" if tok else "0"
+            # Get the right sprite
+            ship_key = self._get_ship_class(name) or "mothership"
+            sprite_lines = SHIP_SPRITES.get(ship_key, SHIP_SPRITES["mothership"])
 
-        key = self._agent_to_key.get(name, "")
-        is_open = name in self._open_windows
-        key_style = "bold green" if is_open else "dim"
-        key_label = f" [{key_style}][{key}][/{key_style}]" if key else ""
+            # Compute sprite bounds
+            sh = len(sprite_lines)
+            sw = max(len(line) for line in sprite_lines)
+            ox = ax - sw // 2
+            oy = ay - sh // 2
 
-        snippet = self._snippet(name, 28)
+            # Surface burst: expanding ring around ship
+            if sb > 0:
+                ring_r = (16 - sb) * 1.2 + 2
+                for ring_a in range(0, 360, 8):
+                    rad = math.radians(ring_a)
+                    rx = int(ax + math.cos(rad) * ring_r)
+                    ry = int(ay + math.sin(rad) * ring_r * 0.5)
+                    if 0 <= rx < canvas_w and 0 <= ry < canvas_h:
+                        chars[ry][rx] = "◈" if sb > 8 else "◇"
+                        styles[ry][rx] = "bold bright_white" if sb > 8 else "dim white"
 
-        active = st.status in ("thinking", "working")
-        box = DOUBLE if active else ROUNDED
-        if active:
-            bstyle = f"bold {color}"
-        elif is_open:
-            bstyle = color
-        else:
-            bstyle = "dim"
-        if st.status == "thinking" and self._frame % 4 < 2:
-            bstyle = color
+            # Stamp sprite characters
+            draw_style = f"bold {color}" if is_fore else ("dim" if is_dim else color)
+            for ly, line in enumerate(sprite_lines):
+                for lx, ch in enumerate(line):
+                    if ch == " ":
+                        continue
+                    px, py = ox + lx, oy + ly
+                    if 0 <= px < canvas_w and 0 <= py < canvas_h:
+                        chars[py][px] = ch
+                        styles[py][px] = draw_style
 
-        content = (
-            f"{dot} [bold]{name}[/bold]{key_label}\n"
-            f"[dim]{act}[/dim]  [dim]{tok_str} tok[/dim]"
-        )
-        if snippet:
-            content += f"\n[dim]\"{snippet}\"[/dim]"
-
-        return Panel(content, box=box, border_style=bstyle, height=5)
-
-    def _research_pool(self) -> Panel:
-        cards: list[str] = []
-        for i, rname in enumerate(self._research_names):
-            st = self.agents.get(rname, AgentStatus())
-            dot = STATUS_DOT.get(st.status, STATUS_DOT["idle"])
-            act = (st.activity or st.status)[:10]
+            # Label below ship
+            key = self._agent_to_key.get(name, "")
             tok = st.input_tokens + st.output_tokens
-            tok_str = f"{tok:,}" if tok else "0"
-            key = self._agent_to_key.get(rname, "")
-            is_open = rname in self._open_windows
-            ks = "bold green" if is_open else "dim"
+            tok_s = f"{tok:,}" if tok else "0"
+            act = (st.activity or st.status)[:12]
+            label1 = f"{name} [{key}]"
+            label2 = f"{act} {tok_s}t"
+            label_y = oy + sh
+            label_x = ax - len(label1) // 2
+            lbl_style = f"bold {color}" if is_fore else ("dim" if is_dim else "bold")
+            for i, ch in enumerate(label1):
+                px = label_x + i
+                if 0 <= px < canvas_w and 0 <= label_y < canvas_h:
+                    chars[label_y][px] = ch
+                    styles[label_y][px] = lbl_style
+            label_x2 = ax - len(label2) // 2
+            if 0 <= label_y + 1 < canvas_h:
+                for i, ch in enumerate(label2):
+                    px = label_x2 + i
+                    if 0 <= px < canvas_w:
+                        chars[label_y + 1][px] = ch
+                        styles[label_y + 1][px] = "dim"
 
-            snip = self._snippet(rname, 25)
-            snip_part = f" [dim]\"{snip}\"[/dim]" if snip else ""
+            # Selected ship: show output log
+            if is_fore:
+                raw = self._last_output.get(name, "")
+                if raw:
+                    log_start_y = label_y + 2
+                    log_lines = raw.strip().split("\n")
+                    max_log = canvas_h - log_start_y - 1
+                    for li, line in enumerate(log_lines[-max_log:]):
+                        ly = log_start_y + li
+                        if ly >= canvas_h:
+                            break
+                        lx = max(2, ax - len(line) // 2)
+                        for ci, ch in enumerate(line[:canvas_w - lx - 1]):
+                            px = lx + ci
+                            if 0 <= px < canvas_w:
+                                chars[ly][px] = ch
+                                styles[ly][px] = "dim"
 
-            cards.append(
-                f"{dot} R{i + 1} [dim]{act}[/dim]  "
-                f"[dim]{tok_str}[/dim]  [{ks}][{key}][/{ks}]"
-                f"{snip_part}"
-            )
+        # ── Convert canvas to Rich Text ────────────────────────
+        result = Text()
+        for y in range(canvas_h):
+            x = 0
+            while x < canvas_w:
+                style = styles[y][x]
+                span_start = x
+                while x < canvas_w and styles[y][x] == style:
+                    x += 1
+                segment = "".join(chars[y][span_start:x])
+                result.append(segment, style=style or None)
+            result.append("\n")
 
-        any_active = any(
-            self.agents.get(n, AgentStatus()).status in ("thinking", "working")
-            for n in self._research_names
-        )
-        any_open = any(n in self._open_windows for n in self._research_names)
-        border = "bold cyan" if any_active else ("cyan" if any_open else "dim")
-        box = DOUBLE if any_active else ROUNDED
+        return Panel(result, border_style="dim cyan", padding=0)
 
-        return Panel(
-            "\n".join(cards),
-            box=box,
-            border_style=border,
-            title="[dim]Research Pool[/dim]",
-            height=len(self._research_names) + 2,
-        )
+    def _mini_dots(self, exclude: str = "") -> Text:
+        """Collapsed agent dots: (●) R-2 thinking  (○) Reasoning idle"""
+        parts: list[str] = []
+        for name, st in self.agents.items():
+            if name == exclude:
+                continue
+            color = self._STATUS_COLORS.get(st.status, "white")
+            active = st.status in ("thinking", "working")
+            dot = f"[{color}]\u25cf[/{color}]" if active else f"[dim]\u25cb[/dim]"
+            key = self._agent_to_key.get(name, "")
+            key_lbl = f"[dim][{key}][/dim]" if key else ""
+            act = (st.activity or st.status)[:10]
+            parts.append(f" ({dot}) {name}{key_lbl} [dim]{act}[/dim]")
+        return Text.from_markup("".join(parts) or " [dim]no other agents[/dim]")
 
     def _snippet(self, name: str, max_len: int) -> str:
         raw = self._last_output.get(name, "")
@@ -716,33 +1214,6 @@ class Dashboard:
                     text += "\u2026"
                 return text
         return raw[:max_len].replace("\n", " ")
-
-    def _arrow(self, from_name: str, to_name: str) -> Text:
-        key = f"{from_name}->{to_name}"
-        ttl = self._active_flows.get(key, 0)
-        color = _color(from_name)
-
-        if ttl <= 0:
-            return Text.from_markup("[dim]\u00b7 \u00b7 \u00b7 \u00b7[/dim]")
-
-        width = 5
-        pos = self._frame % (width + 1)
-        parts: list[str] = []
-        for i in range(width):
-            if i == pos:
-                parts.append(f"[bold {color}]\u25cf[/bold {color}]")
-            elif abs(i - pos) == 1 and pos < width:
-                parts.append(f"[{color}]\u25cb[/{color}]")
-            else:
-                parts.append(f"[dim {color}]\u2500[/dim {color}]")
-
-        tip = (
-            f"[bold {color}]\u25b8[/bold {color}]"
-            if pos >= width - 1
-            else "[dim]\u25b8[/dim]"
-        )
-        parts.append(tip)
-        return Text.from_markup("".join(parts))
 
     # ── Positions view (master-detail) ─────────────────────────
 
@@ -1418,16 +1889,14 @@ class Dashboard:
             )
 
         # View indicator
-        mode_labels = {"feed": "feed", "positions": "positions", "hypotheses": "hypotheses"}
-        current = mode_labels.get(self._view_mode, "feed")
-
-        open_keys = [
-            self._agent_to_key[n]
-            for n in self._open_windows
-            if n in self._agent_to_key
-        ]
-        if open_keys:
-            current = f"agent {''.join(open_keys)}"
+        mode_labels = {
+            "balls": "swarm", "feed": "feed",
+            "positions": "positions", "hypotheses": "hypotheses",
+        }
+        current = mode_labels.get(self._view_mode, "swarm")
+        if self._selected_agent:
+            key = self._agent_to_key.get(self._selected_agent, "")
+            current = f"{self._selected_agent} [{key}]"
 
         if self._sell_confirm:
             return Text.from_markup(
@@ -1452,14 +1921,17 @@ class Dashboard:
             f"[dim][bold]f[/bold]eed  "
             f"[bold]p[/bold]os  "
             f"[bold]h[/bold]yp  "
-            f"[bold]1[/bold]-[bold]6[/bold] agents  "
+            f"[bold]1[/bold]-[bold]9[/bold] select  "
+            f"[bold]s[/bold]cout  "
+            f"[bold]d[/bold]ive  "
+            f"[bold]c[/bold]ontra  "
+            f"[bold]r[/bold]eason  "
+            f"SHIFT=recall  "
             f"[bold]i[/bold] hint  "
             f"[bold]g[/bold] {power_label}  "
             f"Esc back[/dim]"
         )
 
-        if self._footer_extra:
-            parts += f"  [dim]|  {self._footer_extra}[/dim]"
         if self.model:
             m = self.model if len(self.model) <= 20 else self.model[:17] + "..."
             parts += f"  [dim]|  {m}[/dim]"

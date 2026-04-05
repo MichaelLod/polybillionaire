@@ -586,56 +586,112 @@ def sell_position(position_num: int) -> None:
 
 
 @main.command("org")
-@click.option("--cycles", "-c", default=None, type=int, help="Number of cycles (infinite if omitted)")
-@click.option("--interval", "-i", default=300, help="Seconds between cycles (default: 300 pace mode)")
-@click.option("--proposals", "-p", default=5, help="Max trade proposals per cycle")
-@click.option("--scan-limit", "-n", default=30, help="Markets to scan per cycle")
-@click.option(
-    "--model", "-m",
-    default="sonnet",
-    help="Claude model (sonnet, opus, haiku)",
-)
-@click.option("--fresh", is_flag=True, help="Clear agent sessions (keeps DB/memory)")
-@click.option("--reset-db", is_flag=True, help="Also wipe institutional memory DB (use with --fresh)")
-@click.option("--simple", is_flag=True, help="Use simple stream output instead of TUI dashboard")
+@click.option("--simple", is_flag=True, help="Plain text output instead of TUI dashboard")
 @click.option("--daily/--no-daily", default=True, help="Trade short-term markets (default: on)")
+@click.option("--fresh", is_flag=True, help="Clear agent sessions")
+@click.option("--reset-db", is_flag=True, help="Wipe institutional memory DB (use with --fresh)")
+@click.option("--config", "-c", default=None, type=click.Path(), help="Agent config YAML (default: agents.yaml)")
+@click.option("--live", is_flag=True, help="Use real money (LiveTrader) instead of paper trading")
+@click.option("--power", is_flag=True, help="Power mode: more agents, faster intervals, max GPU utilization")
 def org(
-    cycles: int | None,
-    interval: int,
-    proposals: int,
-    scan_limit: int,
-    model: str,
-    fresh: bool,
-    reset_db: bool,
     simple: bool,
     daily: bool,
+    fresh: bool,
+    reset_db: bool,
+    config: str | None,
+    live: bool,
+    power: bool,
 ) -> None:
-    """Run the autonomous zero-human trading organization (paper mode).
+    """Run the autonomous trading swarm.
 
-    Each agent is a Claude Code session — uses your existing auth,
-    no API key needed.  Sessions persist across runs.
+    Always-on research agents find edges, reasoning evaluates them,
+    trades execute automatically. Configure agents via agents.yaml.
 
-    By default shows a full-screen TUI dashboard.  Use --simple for
-    plain sequential output (good for piping or logging).
-    Use --fresh to wipe agent sessions (new prompts take effect).
-    Add --reset-db to also wipe the institutional memory database.
+    Use --fresh to clear agent sessions. Add --reset-db to also
+    wipe the institutional memory database.
+
+    Use --live to trade with real money (requires POLY_PRIVATE_KEY in .env).
+    Default is paper trading.
     """
-    from .org.runner import Organization
+    from pathlib import Path
+    from .org.bus import EventBus
+    from .org.db import OrgDB
+    from .org.display import Display
+    from .org.dashboard import Dashboard
+    from .org.tools import ToolKit
+    from .org.swarm import Swarm
+    from .org.agent_config import load_configs, POWER_CONFIGS
+
+    if config:
+        configs = load_configs(Path(config))
+    elif power:
+        import copy
+        configs = [copy.deepcopy(c) for c in POWER_CONFIGS]
+    else:
+        configs = load_configs()
 
     with PolymarketClient() as client:
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        organization = Organization(
-            client,
-            trader,
-            model=model,
-            max_proposals=proposals,
-            scan_limit=scan_limit,
-            simple=simple,
-            daily_only=daily,
-        )
+        if live:
+            console.print("[bold red]LIVE TRADING MODE — real money at risk![/bold red]")
+            trader = _get_live_trader()
+            trader.set_client(client)
+            # Set bankroll to actual USDC balance
+            bal = trader.get_balance()
+            if "usdc" in bal:
+                trader.risk.bankroll = bal["usdc"]
+                console.print(f"[dim]USDC balance: ${bal['usdc']:.4f}[/dim]")
+            recovered = trader.recover_positions()
+            if recovered:
+                console.print(f"[yellow]Recovered {recovered} position(s) from Polymarket[/yellow]")
+            console.print(f"[dim]Bankroll: ${trader.bankroll:.4f} | Positions: {len(trader.positions)}[/dim]")
+        else:
+            trader = PaperTrader(client, bankroll=get_bankroll())
+        db = OrgDB()
+        bus = EventBus()
+
         if fresh:
-            organization.clear_sessions(reset_db=reset_db)
-        organization.run(cycles=cycles, interval=interval)
+            import shutil
+            sessions_dir = Path("org_sessions")
+            if sessions_dir.exists():
+                shutil.rmtree(sessions_dir)
+            if reset_db:
+                db.reset()
+
+        display = Display() if simple else Dashboard(
+            db=db, trader=trader,
+        )
+        toolkit = ToolKit(client, trader)
+        # Fleet mode: start with 0 agents, user deploys from TUI.
+        # --power bypasses fleet mode and deploys everything at once.
+        fleet = not simple and not power
+        swarm_runner = Swarm(
+            db=db, bus=bus, toolkit=toolkit, trader=trader,
+            display=display, configs=configs, daily_only=daily,
+            fleet_mode=fleet,
+        )
+        # Wire dashboard to swarm for fleet deploy/recall
+        if hasattr(display, "swarm"):
+            display.swarm = swarm_runner
+        bus.on_message(display.render)
+        swarm_runner.run()
+
+
+@main.command("search-bridge")
+def search_bridge() -> None:
+    """Start the local search bridge server (localhost:3456).
+
+    The Chrome search extension polls this server for queries and
+    returns Google search results. Run this before starting the swarm.
+    """
+    from .search_bridge import run
+    console.print(BANNER, style="bold cyan")
+    console.print("[bold]Starting search bridge...[/bold]")
+    console.print("Load the Chrome extension from [cyan]chrome-search/[/cyan]")
+    console.print("  1. Open chrome://extensions")
+    console.print("  2. Enable Developer Mode")
+    console.print("  3. Load Unpacked → select chrome-search/ folder")
+    console.print("")
+    run()
 
 
 if __name__ == "__main__":

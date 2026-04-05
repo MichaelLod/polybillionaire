@@ -89,7 +89,9 @@ class Display:
         self.console.print(f"[{style}]{agent_name}[/{style}] [dim]thinking...[/dim]")
 
     def agent_done(self, name: str, summary: str = "") -> None:
-        pass
+        if summary:
+            style = AGENT_STYLES.get(name, "white")
+            self.console.print(f"[{style}]{name}[/{style}] [dim]done: {summary}[/dim]")
 
     def update_portfolio(self, **kw: float) -> None:
         pass
