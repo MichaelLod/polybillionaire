@@ -12,3 +12,4 @@ agent_memories.json
 *.db-wal
 *.db-journal
 paper_portfolio.json
+.claude/

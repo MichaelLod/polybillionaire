@@ -59,6 +59,21 @@ class Trade:
     paper: bool = True
 
 
+#: Polymarket CLOB orderbook-reported minimum order size, in shares.
+#: Empirically "5" for every market we've sampled — applies to both
+#: BUY and SELL orders via the API. Issue #265 on py-clob-client
+#: confirms the server rejects ``Size (X) lower than the minimum: 5``.
+POLYMARKET_MIN_SHARES = 5.0
+
+#: Empirical floor for marketable BUY orders. This wallet's 12-trade
+#: live BUY history has nothing below $1.62; attempting smaller market
+#: BUYs surfaces an "invalid amount for a marketable BUY order, min
+#: size: $1" error. SELLs have no such floor (confirmed sells at
+#: $0.0002 notional). We add a small buffer on top so fills don't
+#: round just below the threshold.
+POLYMARKET_MIN_MARKET_BUY_USD = 1.05
+
+
 class RiskManager:
     """Enforces position limits and risk rules."""
 
@@ -81,7 +96,32 @@ class RiskManager:
     def max_bet(self) -> float:
         return self.bankroll * self.max_bet_fraction
 
-    def can_trade(self, cost: float, num_positions: int) -> tuple[bool, str]:
+    def can_trade(
+        self,
+        cost: float,
+        num_positions: int,
+        price: float = 0.0,
+        live: bool = False,
+    ) -> tuple[bool, str]:
+        # Feasibility: Polymarket enforces a 5-share minimum per
+        # order AND (for market BUYs) a ~$1 USDC notional floor.
+        # If the per-share cost can't reach that floor inside our
+        # bet cap, the trade simply cannot fill — reject early so
+        # Reasoning learns not to re-propose it.
+        if price > 0:
+            min_cost_shares = POLYMARKET_MIN_SHARES * price
+            required = max(
+                min_cost_shares,
+                POLYMARKET_MIN_MARKET_BUY_USD if live else 0.0,
+            )
+            if required > self.max_bet:
+                return False, (
+                    f"Min cost ${required:.2f} (5 shares @ ${price:.3f}"
+                    + (f", $1.05 live buy floor" if live else "")
+                    + f") exceeds max bet ${self.max_bet:.2f}"
+                )
+            if cost < required:
+                cost = required
         if cost > self.max_bet:
             return False, f"Cost ${cost:.2f} exceeds max bet ${self.max_bet:.2f}"
         if cost > self.bankroll:
@@ -98,8 +138,24 @@ class RiskManager:
         loss_pct = (position.entry_price - position.current_price) / position.entry_price
         return loss_pct >= self.stop_loss_pct
 
-    def update_bankroll(self, pnl: float) -> None:
-        self.bankroll += pnl
+    def update_bankroll(self, delta: float) -> None:
+        """Adjust the bankroll by a raw cash delta (buy cost, sell proceeds).
+
+        Does NOT touch ``daily_loss`` — that's for realized P&L only.
+        Previously this method incremented ``daily_loss`` on any negative
+        delta, which meant every BUY (passed ``-cost``) registered the
+        full notional as a "loss" even when no position had closed.
+        After one $1.96 BTC buy today, ``daily_loss`` hit the $1.50
+        ceiling and blocked every subsequent trade for the rest of the
+        day even though nothing had actually been lost.
+        """
+        self.bankroll += delta
+
+    def record_realized_pnl(self, pnl: float) -> None:
+        """Record a realized P&L (sell proceeds − cost basis, or payout −
+        cost on settlement). Only negative realized P&L increments the
+        daily-loss counter — gross buy outflows do not.
+        """
         if pnl < 0:
             self.daily_loss += abs(pnl)
 
@@ -153,7 +209,9 @@ class PaperTrader:
             return False, f"Invalid price: {price}"
 
         cost = price * size
-        can, reason = self.risk.can_trade(cost, len(self.positions))
+        can, reason = self.risk.can_trade(
+            cost, len(self.positions), price, live=False,
+        )
         if not can:
             return False, reason
 
@@ -210,6 +268,7 @@ class PaperTrader:
         pnl = (price - pos.entry_price) * sell_size
 
         self.risk.update_bankroll(proceeds)
+        self.risk.record_realized_pnl(pnl)
         self.trades.append(Trade(
             token_id=token_id,
             market_question=pos.market_question,
@@ -269,6 +328,7 @@ class PaperTrader:
             proceeds = payout_price * pos.size
             pnl = proceeds - pos.cost
             self.risk.update_bankroll(proceeds)
+            self.risk.record_realized_pnl(pnl)
             to_remove.append(pos)
 
             self.trades.append(Trade(
@@ -429,6 +489,7 @@ class LiveTrader:
         end_date: str = "",
     ) -> tuple[bool, str]:
         """Buy shares at market price via CLOB API."""
+        from py_clob_client.clob_types import OrderType
         from py_clob_client.order_builder.constants import BUY
 
         # Estimate cost from orderbook
@@ -441,9 +502,20 @@ class LiveTrader:
                 pass
 
         cost = price * size if price > 0 else size * 0.5
-        can, reason = self.risk.can_trade(cost, len(self.positions))
+        can, reason = self.risk.can_trade(
+            cost, len(self.positions), price, live=True,
+        )
         if not can:
             return False, reason
+        # Bump cost up to the feasibility floor the risk layer
+        # computed (5 shares × price OR $1.05 market-buy minimum).
+        min_floor = max(
+            POLYMARKET_MIN_SHARES * price if price > 0 else 0.0,
+            POLYMARKET_MIN_MARKET_BUY_USD,
+        )
+        if cost < min_floor:
+            cost = min_floor
+            size = round(cost / price, 2) if price > 0 else size
 
         try:
             signed = self.clob.create_market_order(
@@ -453,9 +525,31 @@ class LiveTrader:
                     side=BUY,
                 )
             )
-            result = self.clob.post_order(signed)
+            # IMPORTANT: post_order defaults to OrderType.GTC which posts
+            # a resting limit order. For a true market order we must
+            # pass OrderType.FOK so the exchange matches-or-kills. The
+            # previous default-GTC behavior silently converted the
+            # "market buy" to a limit order that sat on the book unfilled
+            # — trader.positions recorded the fill but the wallet never
+            # received the shares.
+            result = self.clob.post_order(signed, orderType=OrderType.FOK)
             if "error" in result:
                 return False, str(result["error"])
+            # Defensive: even with FOK, if the exchange reports
+            # takingAmount=0 or status=unmatched, treat as failure.
+            if result.get("status") and str(result["status"]).lower() not in (
+                "matched", "filled", "delayed", "success",
+            ):
+                return False, f"Order not filled: status={result['status']}"
+            if "takingAmount" in result:
+                try:
+                    if float(result["takingAmount"]) <= 0:
+                        return False, (
+                            f"Order not filled: takingAmount=0 "
+                            f"({result.get('status', 'unknown')})"
+                        )
+                except (ValueError, TypeError):
+                    pass
         except Exception as e:
             return False, f"Order failed: {e}"
 
@@ -486,6 +580,7 @@ class LiveTrader:
 
     def sell(self, token_id: str, size: float | None = None) -> tuple[bool, str]:
         """Sell shares at market price via CLOB API."""
+        from py_clob_client.clob_types import OrderType
         from py_clob_client.order_builder.constants import SELL
 
         pos = next((p for p in self.positions if p.token_id == token_id), None)
@@ -493,25 +588,59 @@ class LiveTrader:
             return False, "No position found"
 
         sell_size = size or pos.size
+
+        # Refresh the current price from the orderbook so our P&L
+        # calculation reflects the actual execution price, not the
+        # stale cached ``current_price`` from the buy.
         price = pos.current_price
+        if self._client:
+            try:
+                book = self._client.get_orderbook(token_id)
+                if book.best_bid > 0:
+                    price = book.best_bid
+            except Exception:
+                pass
 
         try:
+            # For SELL market orders, ``MarketOrderArgs.amount`` is
+            # the number of SHARES to sell (not USDC). The previous
+            # code passed ``price * sell_size`` which was a USDC
+            # amount — that would sell ``price * sell_size`` shares
+            # instead of ``sell_size``, so only a fraction of the
+            # intended position actually closed.
             signed = self.clob.create_market_order(
                 self.MarketOrderArgs(
                     token_id=token_id,
-                    amount=price * sell_size,
+                    amount=sell_size,
                     side=SELL,
                 )
             )
-            result = self.clob.post_order(signed)
+            # Must pass FOK — see the comment in buy() above. Without
+            # it post_order defaults to GTC and the "sell" rests on
+            # the book unfilled while we think we've closed out.
+            result = self.clob.post_order(signed, orderType=OrderType.FOK)
             if "error" in result:
                 return False, str(result["error"])
+            if result.get("status") and str(result["status"]).lower() not in (
+                "matched", "filled", "delayed", "success",
+            ):
+                return False, f"Sell not filled: status={result['status']}"
+            if "takingAmount" in result:
+                try:
+                    if float(result["takingAmount"]) <= 0:
+                        return False, (
+                            f"Sell not filled: takingAmount=0 "
+                            f"({result.get('status', 'unknown')})"
+                        )
+                except (ValueError, TypeError):
+                    pass
         except Exception as e:
             return False, f"Sell failed: {e}"
 
         proceeds = price * sell_size
         pnl = (price - pos.entry_price) * sell_size
         self.risk.update_bankroll(proceeds)
+        self.risk.record_realized_pnl(pnl)
         self.trades.append(Trade(
             token_id=token_id,
             market_question=pos.market_question,
@@ -550,6 +679,7 @@ class LiveTrader:
             proceeds = payout_price * pos.size
             pnl = proceeds - pos.cost
             self.risk.update_bankroll(proceeds)
+            self.risk.record_realized_pnl(pnl)
             to_remove.append(pos)
             settled.append({
                 "position": pos,
@@ -695,6 +825,7 @@ class LiveTrader:
             token_id: The token to buy.
             amount: Dollar amount to spend.
         """
+        from py_clob_client.clob_types import OrderType
         from py_clob_client.order_builder.constants import BUY
 
         can, reason = self.risk.can_trade(amount, 0)
@@ -709,8 +840,11 @@ class LiveTrader:
                     side=BUY,
                 )
             )
-            result = self.clob.post_order(signed)
-            self.risk.update_bankroll(-amount)
+            # FOK so the order actually matches market or is cancelled,
+            # instead of resting on the book as a limit (default GTC).
+            result = self.clob.post_order(signed, orderType=OrderType.FOK)
+            if "error" not in result:
+                self.risk.update_bankroll(-amount)
             return result
         except Exception as e:
             return {"error": str(e)}

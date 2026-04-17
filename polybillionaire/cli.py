@@ -1,697 +1,577 @@
-"""CLI interface for Polybillionaire."""
+"""CLI for the short-duration crypto trading bot."""
 
 from __future__ import annotations
 
 import os
-import sys
 
 import click
+import httpx
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
+from .binance_exec import BinanceFutures
 from .client import PolymarketClient
-from .scanner import MarketScanner
+from .crossvenue import scan_opportunities, scan_opportunities_llm
+from .futures import USDC_SYMBOLS, FuturesBot, FuturesConfig
+from .gamma import fetch_all_open_markets, fetch_updown_markets
+from .hourly import HourlyBot, HourlyConfig
 from .trader import LiveTrader, PaperTrader
 
 load_dotenv()
 console = Console()
 
-BANNER = """
- ____       _       ____  _ _ _ _                   _
-|  _ \\ ___ | |_   _| __ )(_) | (_) ___  _ __   __ _(_)_ __ ___
-| |_) / _ \\| | | | |  _ \\| | | | / _ \\| '_ \\ / _` | | '__/ _ \\
-|  __/ (_) | | |_| | |_) | | | | | (_) | | | | (_| | | | |  __/
-|_|   \\___/|_|\\__, |____/|_|_|_|_|\\___/|_| |_|\\__,_|_|_|  \\___|
-              |___/
-"""
 
-
-def get_bankroll() -> float:
+def _bankroll() -> float:
     return float(os.getenv("BANKROLL", "5.0"))
 
 
-@click.group()
-def main() -> None:
-    """Polybillionaire — Polymarket trading toolkit."""
-    pass
-
-
-@main.command()
-@click.option("--limit", "-n", default=20, help="Number of markets to scan")
-@click.option("--min-volume", default=1000.0, help="Minimum 24h volume")
-def scan(limit: int, min_volume: float) -> None:
-    """Scan top markets for trading opportunities."""
-    console.print(BANNER, style="bold cyan")
-    console.print(f"[bold]Scanning top {limit} markets...[/bold]\n")
-
-    with PolymarketClient() as client:
-        scanner = MarketScanner(client, bankroll=get_bankroll())
-        markets = scanner.scan_top_markets(limit=limit)
-
-        if not markets:
-            console.print("[red]No markets found.[/red]")
-            return
-
-        table = Table(title="Top Polymarket Markets", show_lines=True)
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Market", max_width=50)
-        table.add_column("Volume", justify="right", style="green")
-        table.add_column("Liquidity", justify="right", style="cyan")
-        table.add_column("Outcomes", max_width=30)
-        table.add_column("End Date", style="dim")
-
-        for i, m in enumerate(markets[:limit], 1):
-            outcomes = " / ".join(m.outcomes[:3]) if m.outcomes else "—"
-            table.add_row(
-                str(i),
-                m.question[:50],
-                f"${m.volume:,.0f}",
-                f"${m.liquidity:,.0f}",
-                outcomes,
-                m.end_date[:10] if m.end_date else "—",
-            )
-
-        console.print(table)
-        console.print(f"\n[dim]Found {len(markets)} markets. Use 'pb opportunities' for ranked picks.[/dim]")
-
-
-@main.command()
-@click.option("--limit", "-n", default=30, help="Markets to analyze")
-@click.option("--top", "-t", default=10, help="Top opportunities to show")
-@click.option("--min-volume", default=5000.0, help="Minimum volume filter")
-def opportunities(limit: int, top: int, min_volume: float) -> None:
-    """Find and rank trading opportunities."""
-    console.print(BANNER, style="bold cyan")
-    bankroll = get_bankroll()
-    console.print(f"[bold]Finding opportunities (bankroll: ${bankroll:.2f})...[/bold]\n")
-
-    with PolymarketClient() as client:
-        scanner = MarketScanner(client, bankroll=bankroll)
-
-        with console.status("[bold green]Scanning markets..."):
-            markets = scanner.scan_top_markets(limit=limit)
-
-        with console.status("[bold green]Analyzing opportunities..."):
-            opps = scanner.find_opportunities(markets, min_volume=min_volume)
-
-        if not opps:
-            console.print("[yellow]No strong opportunities found right now.[/yellow]")
-            return
-
-        table = Table(title=f"Top {top} Opportunities", show_lines=True)
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Market", max_width=40)
-        table.add_column("Bet", width=6)
-        table.add_column("Price", justify="right")
-        table.add_column("Payout", justify="right", style="bold yellow")
-        table.add_column("24h Vol", justify="right", style="cyan")
-        table.add_column("Score", justify="right")
-        table.add_column("Size", justify="right", style="green")
-        table.add_column("Signals", max_width=45)
-
-        for i, o in enumerate(opps[:top], 1):
-            side_style = "green" if o.side == "YES" else "red"
-            score_style = "bold green" if o.score >= 7 else "bold yellow" if o.score >= 5 else "dim"
-            payout_style = "bold green" if o.payout_multiple >= 10 else "bold yellow" if o.payout_multiple >= 3 else ""
-
-            table.add_row(
-                str(i),
-                o.market.question[:40],
-                Text(o.side, style=side_style),
-                f"${o.price:.3f}",
-                Text(f"{o.payout_multiple:.0f}x", style=payout_style),
-                f"${o.volume_24h:,.0f}",
-                Text(f"{o.score:.1f}", style=score_style),
-                f"${o.recommended_bet:.2f}",
-                o.reason[:45],
-            )
-
-        console.print(table)
-
-        total_recommended = sum(o.recommended_bet for o in opps[:top])
-        console.print(f"\n[bold]Total recommended allocation: ${total_recommended:.2f} / ${bankroll:.2f}[/bold]")
-        console.print(
-            "\n[dim]Strategy: Long shots (low price, high payout) + Momentum plays (trending markets)[/dim]"
-        )
-        console.print("[dim]Use 'pb analyze <keyword>' for deep analysis.[/dim]")
-        console.print("[dim]Use 'pb paper-buy <keyword>' to paper trade.[/dim]")
-
-
-@main.command()
-@click.argument("query")
-def analyze(query: str) -> None:
-    """Deep-analyze a specific market (search by keyword)."""
-    with PolymarketClient() as client:
-        scanner = MarketScanner(client, bankroll=get_bankroll())
-
-        with console.status(f"[bold green]Searching for '{query}'..."):
-            markets = client.search_markets(query, limit=5)
-
-        if not markets:
-            console.print(f"[red]No markets found for '{query}'.[/red]")
-            return
-
-        market = markets[0]
-        console.print(Panel(
-            f"[bold]{market.question}[/bold]\n\n{market.description[:200]}..."
-            if len(market.description) > 200 else
-            f"[bold]{market.question}[/bold]\n\n{market.description}",
-            title="Market Analysis",
-            border_style="cyan",
-        ))
-
-        with console.status("[bold green]Fetching orderbook data..."):
-            analysis = scanner.analyze_market(market)
-
-        table = Table(title="Token Analysis", show_lines=True)
-        table.add_column("Outcome", style="bold")
-        table.add_column("Price", justify="right")
-        table.add_column("Bid", justify="right", style="green")
-        table.add_column("Ask", justify="right", style="red")
-        table.add_column("Spread", justify="right")
-        table.add_column("Bid Depth", justify="right")
-        table.add_column("Ask Depth", justify="right")
-        table.add_column("Momentum", justify="right")
-        table.add_column("Volatility", justify="right")
-
-        for t in analysis["tokens"]:
-            if "error" in t:
-                table.add_row(t["outcome"], f"[red]Error: {t['error'][:30]}[/red]", *["—"] * 7)
-                continue
-            mom_style = "green" if t["momentum"] > 0 else "red" if t["momentum"] < 0 else "dim"
-            table.add_row(
-                t["outcome"],
-                f"${t['midpoint']:.3f}",
-                f"${t['best_bid']:.3f}",
-                f"${t['best_ask']:.3f}",
-                f"{t['spread_pct']:.1f}%",
-                f"${t['bid_depth']:.0f}",
-                f"${t['ask_depth']:.0f}",
-                Text(f"{t['momentum']:+.4f}", style=mom_style),
-                f"{t['volatility']:.4f}",
-            )
-
-        console.print(table)
-        console.print(f"\n[dim]Volume: ${analysis['volume']:,.0f} | Liquidity: ${analysis['liquidity']:,.0f} | Ends: {analysis['end_date'][:10]}[/dim]")
-
-
-@main.command("paper-buy")
-@click.argument("query")
-@click.option("--size", "-s", default=10.0, help="Number of shares to buy")
-@click.option("--outcome", "-o", default="Yes", help="Outcome to buy (Yes/No)")
-def paper_buy(query: str, size: float, outcome: str) -> None:
-    """Paper-trade: buy shares in a market."""
-    with PolymarketClient() as client:
-        markets = client.search_markets(query, limit=3)
-        if not markets:
-            console.print(f"[red]No markets found for '{query}'.[/red]")
-            return
-
-        market = markets[0]
-        token = None
-        for t in market.tokens:
-            if t.get("outcome", "").lower() == outcome.lower():
-                token = t
-                break
-        if not token:
-            token = market.tokens[0] if market.tokens else None
-        if not token:
-            console.print("[red]No tradeable tokens found.[/red]")
-            return
-
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        ok, msg = trader.buy(
-            token_id=token["token_id"],
-            market_question=market.question,
-            outcome=token.get("outcome", "?"),
-            size=size,
-        )
-
-        style = "green" if ok else "red"
-        console.print(f"[{style}]{msg}[/{style}]")
-        if ok:
-            console.print(f"[dim]Bankroll remaining: ${trader.bankroll:.2f}[/dim]")
-
-
-@main.command("paper-sell")
-@click.argument("token_id")
-@click.option("--size", "-s", default=None, type=float, help="Shares to sell (all if omitted)")
-def paper_sell(token_id: str, size: float | None) -> None:
-    """Paper-trade: sell a position."""
-    with PolymarketClient() as client:
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        ok, msg = trader.sell(token_id, size)
-        style = "green" if ok else "red"
-        console.print(f"[{style}]{msg}[/{style}]")
-
-
-@main.command()
-def portfolio() -> None:
-    """Show paper trading portfolio."""
-    with PolymarketClient() as client:
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        alerts = trader.update_positions()
-
-        console.print(Panel(
-            f"[bold]Bankroll:[/bold] ${trader.bankroll:.2f}\n"
-            f"[bold]Positions:[/bold] {len(trader.positions)}\n"
-            f"[bold]Total Value:[/bold] ${trader.total_value:.2f}",
-            title="Paper Portfolio",
-            border_style="green",
-        ))
-
-        if trader.positions:
-            table = Table(title="Open Positions", show_lines=True)
-            table.add_column("Market", max_width=40)
-            table.add_column("Outcome", width=8)
-            table.add_column("Shares", justify="right")
-            table.add_column("Entry", justify="right")
-            table.add_column("Current", justify="right")
-            table.add_column("PnL", justify="right")
-            table.add_column("Token ID", style="dim", max_width=20)
-
-            for p in trader.positions:
-                pnl_style = "green" if p.pnl >= 0 else "red"
-                table.add_row(
-                    p.market_question[:40],
-                    p.outcome,
-                    f"{p.size:.1f}",
-                    f"${p.entry_price:.3f}",
-                    f"${p.current_price:.3f}",
-                    Text(f"${p.pnl:+.2f}", style=pnl_style),
-                    p.token_id[:20] + "...",
-                )
-
-            console.print(table)
-
-        if alerts:
-            for a in alerts:
-                console.print(f"[bold red]{a['message']}[/bold red]")
-
-        if trader.trades:
-            console.print(f"\n[dim]Total trades: {len(trader.trades)}[/dim]")
-
-
-@main.command()
-@click.argument("query")
-def search(query: str) -> None:
-    """Search for markets by keyword."""
-    with PolymarketClient() as client:
-        with console.status(f"[bold green]Searching '{query}'..."):
-            markets = client.search_markets(query)
-
-        if not markets:
-            console.print(f"[yellow]No results for '{query}'.[/yellow]")
-            return
-
-        table = Table(title=f"Search: {query}", show_lines=True)
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Market", max_width=55)
-        table.add_column("Volume", justify="right", style="green")
-        table.add_column("Active", width=6)
-        table.add_column("Slug", style="dim", max_width=25)
-
-        for i, m in enumerate(markets, 1):
-            table.add_row(
-                str(i),
-                m.question[:55],
-                f"${m.volume:,.0f}",
-                "[green]Yes[/green]" if m.active else "[red]No[/red]",
-                m.slug[:25],
-            )
-
-        console.print(table)
-
-
-@main.command()
-@click.option("--hours", "-h", default=24, help="Hours until resolution (default 24)")
-def daily(hours: int) -> None:
-    """Show markets resolving within the next N hours."""
-    console.print(BANNER, style="bold cyan")
-    console.print(f"[bold]Markets resolving within {hours}h...[/bold]\n")
-
-    with PolymarketClient() as client:
-        scanner = MarketScanner(client, bankroll=get_bankroll())
-        markets = client.get_daily_markets(hours=hours)
-
-        if not markets:
-            console.print(f"[yellow]No markets resolving within {hours}h. Trying 48h...[/yellow]")
-            markets = client.get_daily_markets(hours=48)
-            if not markets:
-                console.print("[red]No near-term markets found.[/red]")
-                return
-
-        opps = scanner.find_opportunities(markets)
-
-        table = Table(title=f"Daily Markets ({len(markets)} found, {len(opps)} tradeable)", show_lines=True)
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Market", max_width=50)
-        table.add_column("Ends", style="dim", width=16)
-        table.add_column("Side", width=5)
-        table.add_column("Price", justify="right")
-        table.add_column("Payout", justify="right", style="bold yellow")
-        table.add_column("Vol 24h", justify="right", style="cyan")
-        table.add_column("Score", justify="right")
-
-        if opps:
-            for i, o in enumerate(opps[:20], 1):
-                side_style = "green" if o.side == "YES" else "red"
-                ends = o.market.end_date[:16] if o.market.end_date else "—"
-                table.add_row(
-                    str(i),
-                    o.market.question[:50],
-                    ends,
-                    Text(o.side, style=side_style),
-                    f"${o.price:.3f}",
-                    f"{o.payout_multiple:.0f}x",
-                    f"${o.volume_24h:,.0f}",
-                    f"{o.score:.1f}",
-                )
-        else:
-            for i, m in enumerate(markets[:20], 1):
-                ends = m.end_date[:16] if m.end_date else "—"
-                yes_price = m.outcome_prices[0] if m.outcome_prices else 0
-                table.add_row(
-                    str(i), m.question[:50], ends, "—",
-                    f"${yes_price:.3f}", "—", f"${m.volume_24h:,.0f}", "—",
-                )
-
-        console.print(table)
-        console.print(f"\n[dim]Use 'pb org --daily' to run the full trading org on daily markets.[/dim]")
-
-
-@main.command()
-def status() -> None:
-    """Check Polymarket API status and your config."""
-    console.print(BANNER, style="bold cyan")
-
-    with PolymarketClient() as client:
-        try:
-            client._get("https://clob.polymarket.com", "/ok")
-            console.print("[green]CLOB API: Online[/green]")
-        except Exception as e:
-            console.print(f"[red]CLOB API: Error — {e}[/red]")
-
-    bankroll = get_bankroll()
-    has_key = bool(os.getenv("POLY_PRIVATE_KEY"))
-    has_api = bool(os.getenv("POLY_API_KEY"))
-    console.print(f"\nBankroll: ${bankroll:.2f}")
-    console.print(f"Private key: {'[green]Configured[/green]' if has_key else '[yellow]Not set[/yellow]'}")
-    console.print(f"API creds: {'[green]Configured[/green]' if has_api else '[yellow]Not set[/yellow]'}")
-    console.print(f"Live trading: {'[bold green]READY[/bold green]' if (has_key and has_api) else '[yellow]Paper only[/yellow]'}")
-    console.print(f"Max bet: ${bankroll * float(os.getenv('MAX_BET_FRACTION', '0.10')):.2f}")
-    console.print(f"Stop loss: {float(os.getenv('STOP_LOSS_PCT', '0.50'))*100:.0f}%")
-
-    if has_key and has_api:
-        try:
-            trader = LiveTrader.from_env()
-            bal = trader.get_balance()
-            console.print(f"On-chain balance: {bal}")
-        except Exception as e:
-            console.print(f"[red]Connection error: {e}[/red]")
-
-
-# ── Live Trading Commands ────────────────────────────────────────
-
-
 def _get_live_trader() -> LiveTrader:
-    """Create a LiveTrader from env, or fail with a helpful message."""
     if not os.getenv("POLY_PRIVATE_KEY") or not os.getenv("POLY_API_KEY"):
-        console.print("[red]Live trading requires POLY_PRIVATE_KEY and POLY_API_KEY in .env[/red]")
+        console.print(
+            "[red]Live mode needs POLY_PRIVATE_KEY + POLY_API_KEY "
+            "(+ _SECRET, _PASSPHRASE) in .env[/red]"
+        )
         raise SystemExit(1)
     return LiveTrader.from_env()
 
 
-@main.command("buy")
-@click.argument("query")
-@click.option("--amount", "-a", default=0.50, help="Dollar amount to spend")
-@click.option("--outcome", "-o", default="Yes", help="Outcome to buy (Yes/No)")
-@click.option("--limit-price", "-p", default=None, type=float, help="Limit price (omit for market order)")
-@click.confirmation_option(prompt="Place REAL order with REAL money?")
-def live_buy(query: str, amount: float, outcome: str, limit_price: float | None) -> None:
-    """Buy shares with real money."""
-    with PolymarketClient() as client:
-        markets = client.search_markets(query, limit=3)
-        if not markets:
-            console.print(f"[red]No markets found for '{query}'.[/red]")
-            return
-
-        market = markets[0]
-        token = None
-        for t in market.tokens:
-            if t.get("outcome", "").lower() == outcome.lower():
-                token = t
-                break
-        if not token:
-            token = market.tokens[0] if market.tokens else None
-        if not token:
-            console.print("[red]No tradeable tokens found.[/red]")
-            return
-
-        console.print(f"[bold]Market:[/bold] {market.question}")
-        console.print(f"[bold]Outcome:[/bold] {token.get('outcome', '?')}")
-        console.print(f"[bold]Amount:[/bold] ${amount:.2f}")
-
-        trader = _get_live_trader()
-
-        if limit_price is not None:
-            size = amount / limit_price
-            console.print(f"[bold]Limit price:[/bold] ${limit_price:.3f} ({size:.1f} shares)")
-            result = trader.place_limit_order(
-                token_id=token["token_id"],
-                price=limit_price,
-                size=size,
-            )
-        else:
-            console.print("[bold]Order type:[/bold] Market (best available price)")
-            result = trader.place_market_buy(
-                token_id=token["token_id"],
-                amount=amount,
-            )
-
-        if "error" in result:
-            console.print(f"[red]Order failed: {result['error']}[/red]")
-        else:
-            console.print(f"[bold green]Order placed![/bold green]")
-            console.print(f"Result: {result}")
+@click.group()
+def main() -> None:
+    """Polybillionaire — short-duration crypto trading on Polymarket."""
 
 
-@main.command("orders")
-def live_orders() -> None:
-    """Show open orders."""
-    trader = _get_live_trader()
-    orders = trader.get_open_orders()
-    if not orders:
-        console.print("[dim]No open orders.[/dim]")
-        return
-    for o in orders:
-        console.print(o)
-
-
-@main.command("cancel")
-@click.argument("order_id", default="all")
-def live_cancel(order_id: str) -> None:
-    """Cancel an order (or 'all' to cancel everything)."""
-    trader = _get_live_trader()
-    if order_id == "all":
-        result = trader.cancel_all()
-    else:
-        result = trader.cancel_order(order_id)
-    console.print(result)
-
-
-@main.command("balance")
-def live_balance() -> None:
-    """Check on-chain USDC balance."""
-    trader = _get_live_trader()
-    result = trader.get_balance()
-    if "error" in result:
-        console.print(f"[red]{result['error']}[/red]")
-    else:
-        console.print(Panel(f"[bold]{result}[/bold]", title="On-Chain Balance", border_style="green"))
-
-
-@main.command("positions")
-def positions() -> None:
-    """Show all open paper positions."""
-    with PolymarketClient() as client:
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        if not trader.positions:
-            console.print("[dim]No open positions.[/dim]")
-            return
-
-        trader.update_positions()
-
-        table = Table(title="Open Positions", show_lines=True)
-        table.add_column("#", style="dim", width=3)
-        table.add_column("Market", max_width=45)
-        table.add_column("Side", width=5)
-        table.add_column("Entry", justify="right", width=8)
-        table.add_column("Now", justify="right", width=8)
-        table.add_column("Size", justify="right", width=7)
-        table.add_column("P&L", justify="right", width=10)
-        table.add_column("Token ID", style="dim", max_width=12)
-
-        for i, p in enumerate(trader.positions, 1):
-            pc = "green" if p.pnl >= 0 else "red"
-            table.add_row(
-                str(i),
-                p.market_question[:45],
-                p.outcome,
-                f"${p.entry_price:.4f}",
-                f"${p.current_price:.4f}",
-                f"{p.size:.1f}",
-                f"[{pc}]${p.pnl:+.4f}[/{pc}]",
-                p.token_id[:12] + "...",
-            )
-
-        console.print(table)
-        total_pnl = sum(p.pnl for p in trader.positions)
-        pc = "green" if total_pnl >= 0 else "red"
-        console.print(
-            f"\n  Bankroll: ${trader.bankroll:.2f}  |  "
-            f"Positions: {len(trader.positions)}  |  "
-            f"Total P&L: [{pc}]${total_pnl:+.4f}[/{pc}]"
-        )
-        console.print(f"\n[dim]Use 'pb sell <number>' to close a position.[/dim]")
-
-
-@main.command("sell")
-@click.argument("position_num", type=int)
-def sell_position(position_num: int) -> None:
-    """Sell/close a paper position by its number (from 'pb positions')."""
-    with PolymarketClient() as client:
-        trader = PaperTrader(client, bankroll=get_bankroll())
-        if not trader.positions:
-            console.print("[dim]No open positions.[/dim]")
-            return
-
-        if position_num < 1 or position_num > len(trader.positions):
-            console.print(f"[red]Invalid position #{position_num}. "
-                          f"Valid range: 1-{len(trader.positions)}[/red]")
-            return
-
-        pos = trader.positions[position_num - 1]
-        console.print(f"[bold]Closing:[/bold] {pos.outcome} \"{pos.market_question[:50]}\"")
-        console.print(f"  Entry: ${pos.entry_price:.4f}  |  Size: {pos.size:.1f}")
-
-        ok, msg = trader.sell(pos.token_id)
-        if ok:
-            console.print(f"[bold green]{msg}[/bold green]")
-        else:
-            console.print(f"[red]{msg}[/red]")
-
-
-@main.command("org")
-@click.option("--simple", is_flag=True, help="Plain text output instead of TUI dashboard")
-@click.option("--daily/--no-daily", default=True, help="Trade short-term markets (default: on)")
-@click.option("--fresh", is_flag=True, help="Clear agent sessions")
-@click.option("--reset-db", is_flag=True, help="Wipe institutional memory DB (use with --fresh)")
-@click.option("--config", "-c", default=None, type=click.Path(), help="Agent config YAML (default: agents.yaml)")
-@click.option("--live", is_flag=True, help="Use real money (LiveTrader) instead of paper trading")
-@click.option("--power", is_flag=True, help="Power mode: more agents, faster intervals, max GPU utilization")
-def org(
-    simple: bool,
-    daily: bool,
-    fresh: bool,
-    reset_db: bool,
-    config: str | None,
+@main.command()
+@click.option("--live", is_flag=True, help="Trade real USDC (default: paper)")
+@click.option(
+    "--edge", default=0.07, show_default=True,
+    help="Minimum |p_model - book_mid| to open. 0.07 covers Polymarket's "
+         "post-2024 dynamic taker fee (~3.15%) + slippage + model error.",
+)
+@click.option("--dry-run", is_flag=True, help="Log decisions, don't place orders")
+@click.option(
+    "--horizon", default=3600, show_default=True, type=int,
+    help="Max seconds until market end to consider",
+)
+@click.option("--trade-15m", is_flag=True, help="Also trade 15-minute markets")
+@click.option("--trade-5m", is_flag=True, help="Also trade 5-minute markets")
+@click.option(
+    "--cycle", default=30.0, show_default=True, type=float,
+    help="Seconds between cycles",
+)
+@click.option(
+    "--kelly", default=0.5, show_default=True, type=float,
+    help="Kelly fraction (0.5 = half-Kelly)",
+)
+def hourly(
     live: bool,
-    power: bool,
+    edge: float,
+    dry_run: bool,
+    horizon: int,
+    trade_15m: bool,
+    trade_5m: bool,
+    cycle: float,
+    kelly: float,
 ) -> None:
-    """Run the autonomous trading swarm.
-
-    Always-on research agents find edges, reasoning evaluates them,
-    trades execute automatically. Configure agents via agents.yaml.
-
-    Use --fresh to clear agent sessions. Add --reset-db to also
-    wipe the institutional memory database.
-
-    Use --live to trade with real money (requires POLY_PRIVATE_KEY in .env).
-    Default is paper trading.
-    """
-    from pathlib import Path
-    from .org.bus import EventBus
-    from .org.db import OrgDB
-    from .org.display import Display
-    from .org.dashboard import Dashboard
-    from .org.tools import ToolKit
-    from .org.swarm import Swarm
-    from .org.agent_config import load_configs, POWER_CONFIGS
-
-    if config:
-        configs = load_configs(Path(config))
-    elif power:
-        import copy
-        configs = [copy.deepcopy(c) for c in POWER_CONFIGS]
-    else:
-        configs = load_configs()
+    """Run the trading loop on up-or-down crypto markets."""
+    config = HourlyConfig(
+        edge_threshold=edge,
+        max_seconds_until_end=horizon,
+        trade_15m=trade_15m,
+        trade_5m=trade_5m,
+        cycle_s=cycle,
+        kelly_fraction=kelly,
+        dry_run=dry_run,
+    )
 
     with PolymarketClient() as client:
         if live:
-            console.print("[bold red]LIVE TRADING MODE — real money at risk![/bold red]")
-            trader = _get_live_trader()
+            console.print("[bold red]LIVE TRADING — real USDC at risk[/bold red]")
+            trader: LiveTrader | PaperTrader = _get_live_trader()
             trader.set_client(client)
-            # Set bankroll to actual USDC balance
             bal = trader.get_balance()
             if "usdc" in bal:
                 trader.risk.bankroll = bal["usdc"]
                 console.print(f"[dim]USDC balance: ${bal['usdc']:.4f}[/dim]")
             recovered = trader.recover_positions()
             if recovered:
-                console.print(f"[yellow]Recovered {recovered} position(s) from Polymarket[/yellow]")
-            console.print(f"[dim]Bankroll: ${trader.bankroll:.4f} | Positions: {len(trader.positions)}[/dim]")
+                console.print(f"[yellow]Recovered {recovered} positions[/yellow]")
         else:
-            trader = PaperTrader(client, bankroll=get_bankroll())
-        db = OrgDB()
-        bus = EventBus()
+            trader = PaperTrader(client, bankroll=_bankroll())
+            console.print(
+                f"[dim]Paper mode — bankroll ${trader.bankroll:.2f}[/dim]"
+            )
 
-        if fresh:
-            import shutil
-            sessions_dir = Path("org_sessions")
-            if sessions_dir.exists():
-                shutil.rmtree(sessions_dir)
-            if reset_db:
-                db.reset()
+        bot = HourlyBot(client, trader, config, print_fn=console.print)
+        bot.run()
 
-        display = Display() if simple else Dashboard(
-            db=db, trader=trader,
+
+@main.command()
+@click.option(
+    "--horizon", default=3600, show_default=True, type=int,
+    help="Max seconds until end",
+)
+def discover(horizon: int) -> None:
+    """List active up-or-down crypto markets Gamma sees right now."""
+    with httpx.Client(timeout=15.0) as http:
+        markets = fetch_updown_markets(
+            http, max_seconds_until_end=horizon, min_seconds_until_end=0,
         )
-        toolkit = ToolKit(client, trader)
-        # Fleet mode: start with 0 agents, user deploys from TUI.
-        # --power bypasses fleet mode and deploys everything at once.
-        fleet = not simple and not power
-        swarm_runner = Swarm(
-            db=db, bus=bus, toolkit=toolkit, trader=trader,
-            display=display, configs=configs, daily_only=daily,
-            fleet_mode=fleet,
+
+    if not markets:
+        console.print("[yellow]No active up-or-down crypto markets.[/yellow]")
+        return
+
+    table = Table(title=f"{len(markets)} crypto up-or-down markets", show_lines=True)
+    table.add_column("Symbol")
+    table.add_column("Dur", width=5)
+    table.add_column("Ends in", justify="right")
+    table.add_column("p(Up)", justify="right")
+    table.add_column("Vol", justify="right", style="cyan")
+    table.add_column("Slug", style="dim", max_width=40)
+
+    for m in sorted(markets, key=lambda m: m.seconds_until_end):
+        mins = m.seconds_until_end / 60
+        table.add_row(
+            m.symbol.replace("USDT", ""),
+            m.duration_label,
+            f"{mins:.1f}m",
+            f"{m.up_price:.3f}",
+            f"${m.volume:,.0f}",
+            m.slug[:40],
         )
-        # Wire dashboard to swarm for fleet deploy/recall
-        if hasattr(display, "swarm"):
-            display.swarm = swarm_runner
-        bus.on_message(display.render)
-        swarm_runner.run()
+    console.print(table)
 
 
-@main.command("search-bridge")
-def search_bridge() -> None:
-    """Start the local search bridge server (localhost:3456).
+@main.command()
+def positions() -> None:
+    """Show open paper positions and P&L."""
+    with PolymarketClient() as client:
+        trader = PaperTrader(client, bankroll=_bankroll())
+        trader.update_positions(auto_stop=False)
 
-    The Chrome search extension polls this server for queries and
-    returns Google search results. Run this before starting the swarm.
+        console.print(Panel(
+            f"Bankroll: ${trader.bankroll:.4f}\n"
+            f"Positions: {len(trader.positions)}\n"
+            f"Total value: ${trader.total_value:.4f}",
+            title="Paper Portfolio", border_style="green",
+        ))
+
+        if not trader.positions:
+            return
+
+        table = Table(title="Open Positions", show_lines=True)
+        table.add_column("Market", max_width=50)
+        table.add_column("Side", width=6)
+        table.add_column("Entry", justify="right")
+        table.add_column("Now", justify="right")
+        table.add_column("Size", justify="right")
+        table.add_column("P&L", justify="right")
+        for p in trader.positions:
+            style = "green" if p.pnl >= 0 else "red"
+            table.add_row(
+                p.market_question[:50],
+                p.outcome,
+                f"${p.entry_price:.4f}",
+                f"${p.current_price:.4f}",
+                f"{p.size:.1f}",
+                f"[{style}]${p.pnl:+.4f}[/{style}]",
+            )
+        console.print(table)
+
+
+@main.command()
+def balance() -> None:
+    """Show live USDC balance on Polymarket."""
+    trader = _get_live_trader()
+    result = trader.get_balance()
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+    else:
+        console.print(Panel(
+            f"USDC: ${result['usdc']:.4f}",
+            title="On-chain", border_style="green",
+        ))
+
+
+@main.command()
+def status() -> None:
+    """Show config + API reachability."""
+    has_priv = bool(os.getenv("POLY_PRIVATE_KEY"))
+    has_api = bool(os.getenv("POLY_API_KEY"))
+
+    with PolymarketClient() as client:
+        try:
+            client._get("https://clob.polymarket.com", "/ok")
+            clob_ok = True
+        except Exception:
+            clob_ok = False
+
+    with httpx.Client(timeout=5.0) as http:
+        try:
+            r = http.get("https://api.binance.com/api/v3/ping")
+            binance_ok = r.status_code == 200
+        except Exception:
+            binance_ok = False
+
+    bankroll = _bankroll()
+    max_bet_frac = float(os.getenv("MAX_BET_FRACTION", "0.10"))
+
+    lines = [
+        f"Polymarket CLOB: {'[green]up[/green]' if clob_ok else '[red]down[/red]'}",
+        f"Binance:         {'[green]up[/green]' if binance_ok else '[red]down[/red]'}",
+        f"Bankroll:        ${bankroll:.2f}",
+        f"Max bet:         ${bankroll * max_bet_frac:.2f}  ({max_bet_frac:.0%})",
+        f"Live ready:      {'[green]yes[/green]' if (has_priv and has_api) else '[yellow]paper only[/yellow]'}",
+    ]
+    console.print(Panel("\n".join(lines), title="Status", border_style="cyan"))
+
+
+@main.command()
+@click.option("--live", is_flag=True, help="Place real orders (default: dry-run)")
+@click.option(
+    "--leverage", default=5, show_default=True, type=int,
+    help="Leverage multiplier per trade (Binance futures: 1-125)",
+)
+@click.option(
+    "--stop-pct", default=0.007, show_default=True, type=float,
+    help="Stop-loss distance from entry (0.007 = 0.7%)",
+)
+@click.option(
+    "--edge", default=0.08, show_default=True, type=float,
+    help="Minimum |p_up - 0.5| to open (0.08 = trade when p_up>0.58 or <0.42)",
+)
+@click.option(
+    "--margin-frac", default=0.20, show_default=True, type=float,
+    help="Fraction of available USDC used as margin per trade",
+)
+@click.option(
+    "--max-margin", default=25.0, show_default=True, type=float,
+    help="Hard cap on USD margin per trade",
+)
+@click.option(
+    "--symbols", default="BTC,ETH,SOL", show_default=True,
+    help="Comma-separated coin tickers (resolved to *USDC pairs)",
+)
+@click.option(
+    "--cycle", default=20.0, show_default=True, type=float,
+    help="Seconds between cycles",
+)
+@click.option(
+    "--take-profit", default=0.02, show_default=True, type=float,
+    help="Lock gains in last 10 min if favorable move ≥ this (0 disables)",
+)
+def futures(
+    live: bool,
+    leverage: int,
+    stop_pct: float,
+    edge: float,
+    margin_frac: float,
+    max_margin: float,
+    symbols: str,
+    cycle: float,
+    take_profit: float,
+) -> None:
+    """Run leveraged futures trading on Binance USDM.
+
+    Dry-run by default. Use --live to place real orders.
     """
-    from .search_bridge import run
-    console.print(BANNER, style="bold cyan")
-    console.print("[bold]Starting search bridge...[/bold]")
-    console.print("Load the Chrome extension from [cyan]chrome-search/[/cyan]")
-    console.print("  1. Open chrome://extensions")
-    console.print("  2. Enable Developer Mode")
-    console.print("  3. Load Unpacked → select chrome-search/ folder")
-    console.print("")
-    run()
+    coin_list = [c.strip().upper() for c in symbols.split(",") if c.strip()]
+    pair_list: list[str] = []
+    for c in coin_list:
+        pair = USDC_SYMBOLS.get(c)
+        if pair is None:
+            console.print(f"[red]Unknown coin '{c}'. Known: {list(USDC_SYMBOLS)}[/red]")
+            raise SystemExit(1)
+        pair_list.append(pair)
+
+    if leverage < 1 or leverage > 125:
+        console.print("[red]Leverage must be 1-125[/red]")
+        raise SystemExit(1)
+
+    cfg = FuturesConfig(
+        symbols=pair_list,
+        leverage=leverage,
+        stop_pct=stop_pct,
+        edge_threshold=edge,
+        margin_fraction_per_trade=margin_frac,
+        max_margin_per_trade_usd=max_margin,
+        cycle_s=cycle,
+        take_profit_pct=take_profit,
+        dry_run=not live,
+    )
+
+    try:
+        exec = BinanceFutures.from_env()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    if live:
+        console.print("[bold red]LIVE FUTURES TRADING — real USDC at risk[/bold red]")
+    bot = FuturesBot(exec, cfg, print_fn=console.print)
+    bot.run()
+
+
+@main.command("futures-status")
+def futures_status() -> None:
+    """Show Binance futures wallet state and open positions."""
+    try:
+        exec = BinanceFutures.from_env()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    try:
+        balances = exec._get("/fapi/v2/balance")  # type: ignore
+        acct = exec._get("/fapi/v2/account")  # type: ignore
+    except Exception as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    usdc = next((a for a in balances if a.get("asset") == "USDC"), {})
+    usdt = next((a for a in balances if a.get("asset") == "USDT"), {})
+    lines = [
+        f"canTrade:          {acct.get('canTrade')}",
+        f"totalWalletUSDT:   ${float(acct.get('totalWalletBalance') or 0):.4f}",
+        f"USDC available:    ${float(usdc.get('availableBalance') or 0):.4f}",
+        f"USDT available:    ${float(usdt.get('availableBalance') or 0):.4f}",
+    ]
+    console.print(Panel("\n".join(lines), title="Binance Futures", border_style="cyan"))
+
+    positions = exec.get_positions()
+    if not positions:
+        console.print("[dim]No open positions.[/dim]")
+        return
+    table = Table(title="Open Positions", show_lines=True)
+    table.add_column("Symbol")
+    table.add_column("Side")
+    table.add_column("Qty", justify="right")
+    table.add_column("Entry", justify="right")
+    table.add_column("Mark", justify="right")
+    table.add_column("uPnL", justify="right")
+    table.add_column("Lev", justify="right")
+    for p in positions:
+        style = "green" if p.unrealized_pnl >= 0 else "red"
+        table.add_row(
+            p.symbol, p.side, f"{p.qty}",
+            f"${p.entry_price:.4f}", f"${p.mark_price:.4f}",
+            f"[{style}]${p.unrealized_pnl:+.4f}[/{style}]",
+            f"{p.leverage}×",
+        )
+    console.print(table)
+
+
+@main.command("kalshi")
+@click.option(
+    "--status", default="open", show_default=True,
+    type=click.Choice(["unopened", "open", "closed", "settled"]),
+)
+@click.option(
+    "--limit", default=20, show_default=True, type=int,
+    help="How many markets to list (max 1000)",
+)
+@click.option("--series", default=None, help="Filter by series ticker (e.g. KXPRES)")
+def kalshi_cmd(status: str, limit: int, series: str | None) -> None:
+    """Smoke-test the Kalshi client — list open markets + prices."""
+    from .kalshi import KalshiClient
+
+    k = KalshiClient()
+    try:
+        markets = k.get_markets(status=status, series_ticker=series, limit=limit)
+    finally:
+        k.close()
+
+    if not markets:
+        console.print(f"[yellow]No {status} markets found.[/yellow]")
+        return
+
+    table = Table(title=f"Kalshi {status} markets ({len(markets)})")
+    table.add_column("Ticker")
+    table.add_column("Title")
+    table.add_column("YES bid", justify="right")
+    table.add_column("YES ask", justify="right")
+    table.add_column("Last", justify="right")
+    table.add_column("Vol 24h", justify="right")
+    table.add_column("Closes")
+    for m in markets:
+        table.add_row(
+            m.ticker[:40],
+            (m.title + " " + m.subtitle)[:50],
+            f"{m.yes_bid:.3f}", f"{m.yes_ask:.3f}",
+            f"{m.last_price:.3f}",
+            f"{m.volume_24h:.0f}",
+            m.close_time.strftime("%m-%d %H:%M"),
+        )
+    console.print(table)
+
+
+#: Polymarket slug fragments that identify strike-based crypto
+#: up/down markets. These match poorly against Kalshi's own crypto
+#: strike markets via title-fuzzy alone (bogus hits on "Bitcoin above
+#: X vs Bitcoin above Y"), so we exclude them — the hourly bot already
+#: handles same-venue edge on these.
+_POLY_STRIKE_MARKET_MARKERS = ("up-or-down", "updown")
+
+#: Kalshi series with strike-based crypto markets; excluded from arb
+#: scan for the same reason as above. Categorical markets (Trump
+#: mentions, sports, elections) match cleanly on titles.
+_KALSHI_STRIKE_SERIES = frozenset({"KXBTC", "KXBTCD", "KXETHD", "KXSOL", "KXETH", "KXSP500"})
+
+
+@main.command("scan-arb")
+@click.option(
+    "--horizon-days", default=7, show_default=True, type=float,
+    help="Only scan markets closing within this many days",
+)
+@click.option(
+    "--min-edge", default=0.07, show_default=True, type=float,
+    help="Minimum post-fee edge (0.07 = 7%) — see crossvenue.py for fee math",
+)
+@click.option(
+    "--min-vol", default=100.0, show_default=True, type=float,
+    help="Minimum 24h Kalshi contract volume to consider liquid",
+)
+@click.option(
+    "--similarity", default=0.70, show_default=True, type=float,
+    help="Title-fuzzy-match threshold (0-1). Lowering below 0.65 lets in "
+         "strike-vs-strike false positives.",
+)
+@click.option(
+    "--time-bucket-hours", default=12.0, show_default=True, type=float,
+    help="Candidate pairs must close within ±N hours of each other",
+)
+@click.option("--poly-safe", is_flag=True, help="Only show opportunities where Polymarket is the cheap leg (EU-safe)")
+@click.option(
+    "--include-strike-markets", is_flag=True,
+    help="Don't filter out strike-based crypto markets (off by default — "
+         "they generate false positives on title-fuzzy match)",
+)
+@click.option(
+    "--llm-match", is_flag=True,
+    help="Use a local LM-Studio LLM to score market pair equivalence "
+         "instead of the fuzzy-text matcher. Requires LM Studio running.",
+)
+@click.option(
+    "--llm-threshold", default=0.7, show_default=True, type=float,
+    help="Minimum LLM equivalence score (0-1) to treat a pair as the same market",
+)
+def scan_arb(
+    horizon_days: float, min_edge: float, min_vol: float,
+    similarity: float, time_bucket_hours: float,
+    poly_safe: bool, include_strike_markets: bool,
+    llm_match: bool, llm_threshold: float,
+) -> None:
+    """Scan for Kalshi↔Polymarket arb opportunities above ``min_edge``."""
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    from .kalshi import KalshiClient
+
+    max_sec = int(horizon_days * 86400)
+    max_close_ts = int((datetime.now(timezone.utc) + timedelta(seconds=max_sec)).timestamp())
+
+    console.print(f"[dim]Scanning markets closing within {horizon_days:g} days…[/dim]")
+
+    t0 = time.time()
+    with httpx.Client(timeout=20.0) as http:
+        poly = fetch_all_open_markets(
+            http, max_seconds_until_end=max_sec, min_seconds_until_end=300,
+        )
+    if not include_strike_markets:
+        poly = [p for p in poly if not any(s in p.slug for s in _POLY_STRIKE_MARKET_MARKERS)]
+    console.print(f"[dim]  polymarket: {len(poly)} categorical binary markets ({time.time()-t0:.1f}s)[/dim]")
+
+    t1 = time.time()
+    k = KalshiClient()
+    try:
+        kalshi_mkts = k.fetch_liquid_markets(
+            min_volume_24h=min_vol, max_close_ts=max_close_ts,
+        )
+    finally:
+        k.close()
+    if not include_strike_markets:
+        kalshi_mkts = [m for m in kalshi_mkts if m.series_ticker not in _KALSHI_STRIKE_SERIES]
+    console.print(f"[dim]  kalshi:     {len(kalshi_mkts)} liquid categorical markets ({time.time()-t1:.1f}s)[/dim]")
+
+    if not poly or not kalshi_mkts:
+        console.print("[yellow]Empty side — nothing to scan.[/yellow]")
+        return
+
+    t2 = time.time()
+    if llm_match:
+        from .llm_match import check_server
+
+        ok, msg = check_server()
+        if not ok:
+            console.print(f"[red]LM Studio unreachable:[/red] {msg}")
+            console.print("[red]Start LM Studio and load a model before using --llm-match.[/red]")
+            return
+        console.print(f"[dim]  LM Studio: {msg}[/dim]")
+
+        def on_progress(stage: str, n: int) -> None:
+            if stage == "candidates":
+                console.print(f"[dim]  token+time filter → {n} candidate pairs, scoring with LLM…[/dim]")
+
+        opps = scan_opportunities_llm(
+            poly, kalshi_mkts,
+            min_edge=min_edge, min_llm_equiv=llm_threshold,
+            bucket=timedelta(hours=time_bucket_hours),
+            progress_fn=on_progress,
+        )
+    else:
+        # scan_opportunities fetches its own Kalshi set by default; we
+        # already have one, so pass the markets in via a shim client.
+        opps = scan_opportunities(
+            poly, kalshi=_StubKalshi(kalshi_mkts),  # type: ignore[arg-type]
+            min_edge=min_edge, similarity=similarity,
+            bucket=timedelta(hours=time_bucket_hours),
+        )
+    console.print(f"[dim]  matched in {time.time()-t2:.1f}s — {len(opps)} opps[/dim]")
+
+    if poly_safe:
+        opps = [o for o in opps if o.cheap_venue == "polymarket"]
+
+    if not opps:
+        console.print(f"[yellow]No opportunities ≥ {min_edge*100:.1f}%.[/yellow]")
+        return
+
+    table = Table(title=f"{len(opps)} arb opportunities ≥ {min_edge*100:.1f}%")
+    table.add_column("Edge", justify="right", style="green")
+    table.add_column("Buy YES", width=10)
+    table.add_column("Sell YES", width=10)
+    table.add_column("Sim", justify="right")
+    table.add_column("Polymarket", max_width=38)
+    table.add_column("Kalshi", max_width=38)
+    table.add_column("Notes", style="dim", max_width=20)
+    for o in opps[:40]:
+        poly_px = o.poly.yes_price
+        kal_px = o.kalshi.mid
+        table.add_row(
+            f"{o.edge_after_fees*100:+.1f}%",
+            f"{o.cheap_venue[:4]} @{(poly_px if o.cheap_venue=='polymarket' else kal_px):.3f}",
+            f"{o.expensive_venue[:4]} @{(kal_px if o.cheap_venue=='polymarket' else poly_px):.3f}",
+            f"{o.similarity:.2f}",
+            o.poly.question[:38],
+            (o.kalshi.title + " " + o.kalshi.subtitle).strip()[:38],
+            o.notes,
+        )
+    console.print(table)
+
+
+class _StubKalshi:
+    """Adapter so ``scan_opportunities`` can accept a pre-fetched list
+    of Kalshi markets instead of hitting the API a second time."""
+
+    def __init__(self, markets):
+        self._m = markets
+
+    def get_markets(self, **kwargs):
+        return self._m
+
+    def close(self):
+        pass
 
 
 if __name__ == "__main__":

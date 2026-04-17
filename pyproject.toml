@@ -1,7 +1,7 @@
 [project]
 name = "polybillionaire"
 version = "0.1.0"
-description = "Polymarket trading toolkit — market scanner, analyzer, and trading bot"
+description = "Short-duration crypto trading bot for Polymarket up-or-down markets"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
